@@ -3,12 +3,20 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#include <time.h>
+#include <omp.h>
+#include <limits.h>
+#include <strings.h>   /* strcasecmp */
+#include "file.h"
 #include "util.h"
 #include "extract.h"
 #include "grad.h"
 #include "pi.h"
-#include <time.h>
-#include <omp.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 
 #define POS_RES     0x01   /* 1st bit */
@@ -89,8 +97,6 @@ int GetNextOneToUnwrap(int *a,
     --(*num_index);
     return 1;
 }
-
-
 
 
 
@@ -211,7 +217,6 @@ int UnwrapAroundCutsGoldstein(float *phase,
     float  value;
     int    num_index, max_list_size;
     int    *index_list;
-    char   filename[300];
 
     max_list_size = xsize*ysize;
     AllocateInt(&index_list, max_list_size + 1, "bookkeeping list (index)");
@@ -298,10 +303,6 @@ int UnwrapAroundCutsGoldstein(float *phase,
 
 
 
-
-
-
-
 /* Unwrap the phase data (by Itoh's method) without crossing
  * any branch cuts.  Return number of disconnected pieces.
  */
@@ -353,9 +354,6 @@ int UnwrapAroundCutsFrontier(float *phase,
 
                     *(bitflags + kk) |= UNWRAPPED;
                     value = *(soln + kk);
-
-                    /* save path order */
-                    //*(path_order + kk) = n++;
 
                     /* neighbor pixels */
 
@@ -445,14 +443,10 @@ int UnwrapAroundCutsFrontier(float *phase,
                 if (!(bitflags[k-1] & AVOID))
                 {
                     *(soln + k) = *(soln + k - 1) + Gradient(phase[k], phase[k-1]);
-					//#pragma omp critical
-                    //*(path_order + k) = n++;
                 }
                 else if (!(bitflags[k-xsize] & AVOID))
                 {
                 	*(soln + k) = *(soln + k - xsize) + Gradient(phase[k], phase[k-xsize]);
-					//#pragma omp critical
-                	//*(path_order + k) = n++;
                 }
             }
         }
@@ -462,10 +456,6 @@ int UnwrapAroundCutsFrontier(float *phase,
 
     return num_pieces;
 }
-
-
-
-
 
 
 
@@ -578,7 +568,6 @@ void BranchCuts_parallel(unsigned char *bitflags,
     int            charge, boxctr_i, boxctr_j, boxsize, bs2;
     int            dist, min_dist, rim_i, rim_j, near_i, near_j;
     int            ka, num_active, max_active, *active_list;
-    int            bench;
     int            draw_cut_line;
     double         r;
 
@@ -710,7 +699,7 @@ void GoldsteinBranchCuts_parallel(unsigned char *bitflags,
 
 
     /* length of a band */
-    band = ceil((double)ysize/(double)NUM_CORES);
+    band = (int)ceil((double)ysize/(double)NUM_CORES);
 
     MaxCutLen2 = (xsize + band)/2;
 
@@ -736,9 +725,6 @@ void GoldsteinBranchCuts_parallel(unsigned char *bitflags,
 
 
 
-
-
-
 /* Goldstein's phase-unwrapping algorithm.  The bitflags store */
 /* the masked pixels (to be ignored) and the residues and      */
 /* accumulates other info such as the branch cut pixels.       */
@@ -752,8 +738,6 @@ void GoldsteinBranchCuts_serial(unsigned char *bitflags,
     int            charge, boxctr_i, boxctr_j, boxsize, bs2;
     int            dist, min_dist, rim_i, rim_j, near_i, near_j;
     int            ka, num_active, max_active, *active_list;
-    int            bench;
-    int            draw_cut_line;
     double         r;
 
     if (MaxCutLen < 2) MaxCutLen = 2;
@@ -823,7 +807,7 @@ void GoldsteinBranchCuts_serial(unsigned char *bitflags,
                                                  xsize, ysize, BRANCH_CUT);
                                     }
                                     if (charge==0)
-                                        goto continue_scan;
+                                        goto continue_scan2;
                                 }  /* else */
                             }   /* for (ii ... */
                         }   /* for (jj ... */
@@ -851,7 +835,7 @@ void GoldsteinBranchCuts_serial(unsigned char *bitflags,
                     PlaceCut(bitflags, near_i, near_j, rim_i, rim_j,
                              xsize, ysize, BRANCH_CUT);
                 }
-                continue_scan :
+                continue_scan2 :
                 /* mark all active pixels inactive */
                 for (ka=0; ka<num_active; ka++)
                     bitflags[active_list[ka]] &= ~ACTIVE;  /* turn flag off */
@@ -864,7 +848,6 @@ void GoldsteinBranchCuts_serial(unsigned char *bitflags,
 
     return;
 }
-
 
 
 
@@ -902,10 +885,10 @@ int Residues_parallel(float *phase,
             + Gradient(phase[k+xsize], phase[k+1+xsize])
             + Gradient(phase[k], phase[k+xsize]);
             if (bitflags) {
-                if (r > 0.01) bitflags[k] |= POS_RES;
-                else if (r < -0.01) bitflags[k] |= NEG_RES;
+                if (r > RESIDUE_THRESHOLD) bitflags[k] |= POS_RES;
+                else if (r < -RESIDUE_THRESHOLD) bitflags[k] |= NEG_RES;
             }
-            if (r*r > 0.01)
+            if (r*r > RESIDUE_THRESHOLD * RESIDUE_THRESHOLD)
                 ++NumRes;
         }
     }
@@ -943,10 +926,10 @@ int Residues_serial(float *phase,
             + Gradient(phase[k+xsize], phase[k+1+xsize])
             + Gradient(phase[k], phase[k+xsize]);
             if (bitflags) {
-                if (r > 0.01) bitflags[k] |= POS_RES;
-                else if (r < -0.01) bitflags[k] |= NEG_RES;
+                if (r > RESIDUE_THRESHOLD) bitflags[k] |= POS_RES;
+                else if (r < -RESIDUE_THRESHOLD) bitflags[k] |= NEG_RES;
             }
-            if (r*r > 0.01)
+            if (r*r > RESIDUE_THRESHOLD * RESIDUE_THRESHOLD)
                 ++NumRes;
         }
     }
@@ -954,215 +937,262 @@ int Residues_serial(float *phase,
 }
 
 
+/* -----------------------------------------------------------------------
+ *  Image I/O helpers  (stb_image / stb_image_write)
+ * -------------------------------------------------------------------- */
 
-
-
-
-double goldstein_phase_unwrapping(const char *pname,
-								  const char *data_path,
-                                  int type,
-                                  int xsize,
-                                  int ysize,
-                                  int mask_flag)
+/* Return 1 if path has a .jpg, .jpeg, or .png extension (case-insensitive). */
+static int is_image_path(const char *path)
 {
-    /* data variables */
+    const char *ext = strrchr(path, '.');
+    if (!ext) return 0;
+    return (strcasecmp(ext, ".jpg")  == 0 ||
+            strcasecmp(ext, ".jpeg") == 0 ||
+            strcasecmp(ext, ".png")  == 0);
+}
 
+/*
+ * Load a JPG or PNG file as normalised [0,1] float phase data.
+ * Multi-channel images are automatically converted to grayscale.
+ * *xsize and *ysize are set to image width and height.
+ * Returns a malloc'd float array (caller must free), or exits on error.
+ */
+static float *load_phase_from_image(const char *path, int *xsize, int *ysize)
+{
+    int channels, k, length;
+    float *phase;
+
+    /* Force 1-channel (grayscale) output regardless of the source format */
+    unsigned char *img = stbi_load(path, xsize, ysize, &channels, 1);
+    if (!img) {
+        fprintf(stderr, "Error: cannot load image '%s': %s\n",
+                path, stbi_failure_reason());
+        exit(FILE_OPEN_ERROR);
+    }
+
+    length = (*xsize) * (*ysize);
+    AllocateFloat(&phase, length, "phase from image");
+
+    /* Map pixel values [0, 255] -> [0, 1] (wrapped phase normalised) */
+    for (k = 0; k < length; k++)
+        phase[k] = img[k] / 255.0f;
+
+    stbi_image_free(img);
+    printf("Loaded image '%s' (%d x %d, %d ch -> grayscale)\n",
+           path, *xsize, *ysize, channels);
+    return phase;
+}
+
+/*
+ * Save a float array as a normalised grayscale PNG.
+ * The full value range is linearly mapped to [0, 255].
+ */
+static void save_float_as_png(const char *path, const float *data,
+                               int xsize, int ysize)
+{
+    int k, length = xsize * ysize;
+    float rmin = data[0], rmax = data[0];
+    unsigned char *out;
+
+    for (k = 1; k < length; k++) {
+        if (data[k] < rmin) rmin = data[k];
+        if (data[k] > rmax) rmax = data[k];
+    }
+    float scale = (rmax > rmin) ? 255.0f / (rmax - rmin) : 1.0f;
+
+    out = (unsigned char *)malloc(length);
+    for (k = 0; k < length; k++)
+        out[k] = (unsigned char)((data[k] - rmin) * scale);
+
+    if (!stbi_write_png(path, xsize, ysize, 1, out, xsize))
+        fprintf(stderr, "Warning: failed to write PNG '%s'\n", path);
+    else
+        printf("Saved '%s'\n", path);
+    free(out);
+}
+
+/*
+ * Save a byte array as a binary (black/white) PNG.
+ * Pixels whose bits overlap mask_code are written as 255, others as 0.
+ * If mask_code == 0 every non-zero byte becomes 255.
+ */
+static void save_byte_as_png(const char *path, const unsigned char *data,
+                              int xsize, int ysize, int mask_code)
+{
+    int k, length = xsize * ysize;
+    unsigned char mask = mask_code ? (unsigned char)mask_code : 0xFF;
+    unsigned char *out = (unsigned char *)malloc(length);
+
+    for (k = 0; k < length; k++)
+        out[k] = (data[k] & mask) ? 255 : 0;
+
+    if (!stbi_write_png(path, xsize, ysize, 1, out, xsize))
+        fprintf(stderr, "Warning: failed to write PNG '%s'\n", path);
+    else
+        printf("Saved '%s'\n", path);
+    free(out);
+}
+
+
+/* -----------------------------------------------------------------------
+ *  Core phase-unwrapping pipeline
+ *
+ *  input_path    – full path to the input file.
+ *                  Supported: .jpg / .jpeg / .png  (loaded via stb_image;
+ *                             dimensions auto-detected, xsize/ysize ignored)
+ *                             any other extension   (raw binary read via
+ *                             GetPhase; xsize and ysize must be provided)
+ *
+ *  output_prefix – path prefix used for all output files (no extension).
+ *                  Example: "/data/peaks" produces peaks.res, peaks.out …
+ *                  For image inputs an additional *_unwrapped.png is written.
+ *
+ *  type          – binary-format selector passed to GetPhase (ignored for
+ *                  image inputs):
+ *                    0 = 8-byte complex,  1 = 4-byte complex,
+ *                    2 = 1-byte quantised phase,  3 = 4-byte float phase
+ *
+ *  xsize, ysize  – dimensions for binary inputs; pass 0 for image inputs
+ *                  (values are filled in by load_phase_from_image).
+ *
+ *  mask_flag     – 1 = load a mask from <output_prefix>.mask
+ * -------------------------------------------------------------------- */
+double goldstein_phase_unwrapping(const char *input_path,
+                                   const char *output_prefix,
+                                   int type,
+                                   int xsize,
+                                   int ysize,
+                                   int mask_flag)
+{
     int           *path_order;
     float         *phase;
     float         *soln;
     float         *grady, *gradx;
     float         *mask;
     unsigned char *unwrap, *bitflags;
-    clock_t       t1, t2;
-    double        elapsed_time;
+    clock_t        t1, t2;
+    double         elapsed_time;
+    FILE          *ifp, *ofp, *ifm;
+    char           fname[PATH_MAX];
+    int            k, length, num_pieces, NumRes, MaxCutLen;
+    int            *list;
 
+    int is_img = is_image_path(input_path);
 
-    /* other variables */
+    /* ---- For image inputs load now to discover dimensions ---- */
+    float *img_phase = NULL;
+    if (is_img) {
+        img_phase = load_phase_from_image(input_path, &xsize, &ysize);
+    }
 
+    /* ---- Allocate working arrays ---- */
+    length = xsize * ysize;
 
-    FILE          *ifp, *ofp, *ifq, *ifm;
-    char          prefix[120], fname[120];
-    float         grad, minval, maxval, high_qual, valf, aux;
-    int           k, length, index, p, q, iter=0, bin, l;
-    int           a, b, w, x, y, i, j, num_pieces;
-    int           imin, imax, binarg, NumRes, MaxCutLen;
-    int           *list;
+    AllocateFloat(&phase,      length,          "phase data");
+    AllocateFloat(&soln,       length,          "solution array");
+    AllocateFloat(&grady,      length,          "vertical gradient");
+    AllocateFloat(&gradx,      length,          "horizontal gradient");
+    AllocateByte (&unwrap,     length,          "unwrap flag array");
+    AllocateByte (&bitflags,   length,          "bitflag array");
+    AllocateInt  (&path_order, length,          "integration path");
+    AllocateFloat(&mask,       length,          "mask array");
+    AllocateInt  (&list,       2*(xsize+ysize), "in-out list");
 
-	
-
-    /*
-     *     ALLOCATE MEMORY
-     */
-
-    length = xsize*ysize;
-
-    AllocateFloat(&phase, length, "phase data");
-    AllocateFloat(&soln, length, "solution array");
-    AllocateFloat(&grady, length, "vertical gradient");
-    AllocateFloat(&gradx, length, "horizontal gradient");
-    AllocateByte(&unwrap, length, "flag array");
-    AllocateByte(&bitflags, length, "flag array");
-    AllocateInt(&path_order, length, "integration path");
-    AllocateFloat(&mask, length, "mask array");
-    AllocateInt(&list, 2*(xsize+ysize), "in-out list");
-
-
-    /*
-     *    READ MASK
-     */
-
+    /* ---- Read mask ---- */
     if (mask_flag) {
-		strcpy(prefix, data_path);
-		strcat(prefix,"\\data\\");
-		strcat(prefix,pname);
-		strcat(prefix, ".mask");
-		
-        OpenFile(&ifm, prefix, "rb");
+        snprintf(fname, sizeof(fname), "%s.mask", output_prefix);
+        OpenFile(&ifm, fname, "rb");
         GetPhase(type, ifm, fname, mask, xsize, ysize);
-
-        for (k=0; k<length; k++) {
-            if (mask[k]>0)
-                mask[k] = 1;
-            else
-                mask[k] = 0;
-        }
-    }
-    else
-    {
-        for (k=0; k<length; k++)
-            mask[k] = 1;
+        for (k = 0; k < length; k++)
+            mask[k] = (mask[k] > 0) ? 1.0f : 0.0f;
+    } else {
+        for (k = 0; k < length; k++)
+            mask[k] = 1.0f;
     }
 
-
-
-
-    /*
-     *    READ PHASE
-     */
-    prefix[0]='\0';
-	strcpy(prefix, data_path);
-	strcat(prefix,"\\data\\");
-	strcat(prefix,pname);
-	strcat(prefix, ".phase");
-	
-    OpenFile(&ifp, prefix, "rb");
-    GetPhase(type, ifp, fname, phase, xsize, ysize);
-
-
-    //for (k=0; k<length; k++) phase[k] = phase[k]*TWOPI;
-
-
-    /*
-     *    INIT BITFLAGS
-     */
-	#pragma omp parallel for default(none) \
-	private(k) \
-	shared(length, mask, bitflags)
-    for (k=0; k<length; k++) {
-        if (mask[k]==0)
-            bitflags[k] |= BORDER;
-        else
-            bitflags[k] = 0;
+    /* ---- Read phase ---- */
+    if (is_img) {
+        /* Transfer the pre-loaded data and release the temporary buffer */
+        memcpy(phase, img_phase, length * sizeof(float));
+        free(img_phase);
+        img_phase = NULL;
+    } else {
+        /* Binary file: delegate to the existing reader */
+        strncpy(fname, input_path, sizeof(fname) - 1);
+        fname[sizeof(fname) - 1] = '\0';
+        OpenFile(&ifp, fname, "rb");
+        GetPhase(type, ifp, fname, phase, xsize, ysize);
     }
 
+    /* ---- Initialise bitflags from mask ---- */
+    #pragma omp parallel for default(none) \
+    private(k) \
+    shared(length, mask, bitflags)
+    for (k = 0; k < length; k++)
+        bitflags[k] = (mask[k] == 0.0f) ? BORDER : 0;
 
-    /* Pre-compute the vertical and horizontal gradients */
+    /* ---- Pre-compute x/y gradients ---- */
     Gradxy(phase, gradx, grady, xsize, ysize);
 
-
-    // ** starting time
-
+    /* ======= START TIMING ======= */
     t1 = clock();
 
-    /*
-     *    LOCATE AND PROCESS RESIDUES
-     */
-
-    //NumRes = Residues_serial(phase, bitflags, xsize, ysize);
+    /* ---- Locate residues ---- */
     NumRes = Residues_parallel(phase, bitflags, xsize, ysize);
-
-
     printf("Number of residues: %d\n", NumRes);
-    
-	// Save residues image
-	prefix[0]='\0';
-	strcpy(prefix, data_path);
-	strcat(prefix,"\\data\\");
-	strcat(prefix,pname);
-	strcat(prefix, ".res");
-    SaveByteToImage(bitflags, "residues", prefix, xsize, ysize, 1, 1, 0);
 
+    snprintf(fname, sizeof(fname), "%s.res", output_prefix);
+    SaveByteToImage(bitflags, "residues", fname, xsize, ysize, 1, 1, 0);
+    if (is_img) {
+        snprintf(fname, sizeof(fname), "%s_residues.png", output_prefix);
+        save_byte_as_png(fname, bitflags, xsize, ysize, RESIDUE);
+    }
 
-    /*
-     *    GENERATE BRANCH CUTS
-     */
-
-    MaxCutLen = (xsize + ysize)/2;
-
-    //GoldsteinBranchCuts_serial(bitflags, MaxCutLen, NumRes, xsize, ysize);
+    /* ---- Generate branch cuts ---- */
+    MaxCutLen = (xsize + ysize) / 2;
     GoldsteinBranchCuts_parallel(bitflags, MaxCutLen, NumRes, xsize, ysize);
 
+    snprintf(fname, sizeof(fname), "%s.brc", output_prefix);
+    SaveByteToImage(bitflags, "branch cuts", fname,
+                    xsize, ysize, 1, 1, BRANCH_CUT | BORDER);
+    if (is_img) {
+        snprintf(fname, sizeof(fname), "%s_branchcuts.png", output_prefix);
+        save_byte_as_png(fname, bitflags, xsize, ysize, BRANCH_CUT | BORDER);
+    }
 
-	// Save branch cuts image
-	
-	prefix[0]='\0';
-	strcpy(prefix, data_path);
-	strcat(prefix,"\\data\\");
-	strcat(prefix,pname);
-	strcat(prefix, ".brc");
-    SaveByteToImage(bitflags, "branch cuts", prefix, xsize, ysize, 1, 1, BRANCH_CUT | BORDER);
+    /* ---- Unwrap around cuts ---- */
+    num_pieces = UnwrapAroundCutsFrontier(phase, bitflags, soln,
+                                          xsize, ysize, path_order,
+                                          grady, gradx, list, length);
 
-
-
-    /*
-     *    UNWRAP AROUND CUTS
-     */
-
-    //num_pieces = UnwrapAroundCutsGoldstein(phase,bitflags, soln, xsize, ysize, path_order);
-    num_pieces = UnwrapAroundCutsFrontier(phase,bitflags, soln, xsize, ysize, path_order, grady, gradx, list, length);
-
-
-    // ** end time
-
+    /* ======= END TIMING ======= */
     t2 = clock();
-
-    printf("Number of pieces: %d\n", num_pieces);
-
-    // compute and print the elapsed time in millisec
     elapsed_time = timediff(t1, t2);
 
+    printf("Number of pieces: %d\n", num_pieces);
     printf("Elapsed time: %f ms\n", elapsed_time);
 
-
-    /*
-     *    SAVE RESULTS
-     */
-
-    for (k=0; k<length; k++)
+    /* ---- Scale solution back to radians ---- */
+    for (k = 0; k < length; k++)
         soln[k] *= TWOPI;
 
-
-    /* save solution */
-	
-	strcpy(prefix, data_path);
-    strcat(prefix, "\\data\\");
-    strcat(prefix, pname);
-	strcat(prefix, ".out");
-    OpenFile(&ofp, prefix, "w");
+    /* ---- Save results ---- */
+    snprintf(fname, sizeof(fname), "%s.out", output_prefix);
+    OpenFile(&ofp, fname, "w");
     WriteFloat(ofp, soln, length, fname);
-	
-	
-	/* save path inegration */
-	strcpy(prefix, data_path);
-    strcat(prefix, "\\data\\");
-    strcat(prefix, pname);
-    strcat(prefix, ".path");
-    SaveIntToImage(path_order, "path integration", prefix, xsize, ysize);	
-	printf("\n");
-	
-	
-	/* DEALLOCATE MEMORY */
 
+    snprintf(fname, sizeof(fname), "%s.path", output_prefix);
+    SaveIntToImage(path_order, "path integration", fname, xsize, ysize);
+
+    /* Normalised PNG of the unwrapped surface for image inputs */
+    if (is_img) {
+        snprintf(fname, sizeof(fname), "%s_unwrapped.png", output_prefix);
+        save_float_as_png(fname, soln, xsize, ysize);
+    }
+
+    printf("\n");
+
+    /* ---- Deallocate ---- */
     free(phase);
     free(soln);
     free(unwrap);
@@ -1173,38 +1203,74 @@ double goldstein_phase_unwrapping(const char *pname,
     free(bitflags);
     free(mask);
 
-
     return elapsed_time;
 }
 
 
 
-int main()
+int main(int argc, char *argv[])
 {
-    int    mask_flag       = 0;
-    int    type            = 3;
-    int    MAX_ITERATIONS  = 2;
-    double elapsed_time    = 0;
-	char   data_path[1024];
-    
-	
-    chdir("..");
-    getcwd(data_path,1024);
-	
+    int    mask_flag = 0;
+    int    type      = 3;   /* 4-byte float phase for binary inputs */
+    double elapsed_time = 0.0;
+    int    i;
 
-    NUM_CORES = omp_get_num_procs()/2;
-
-    /* set number of threads */
+    NUM_CORES = omp_get_num_procs() / 2;
+    if (NUM_CORES < 1) NUM_CORES = 1;
     omp_set_num_threads(NUM_CORES);
+    printf("Number of threads: %d\n", NUM_CORES);
 
+    if (argc >= 2) {
+        /* ---- Image mode: path supplied on the command line ---- */
+        const char *img_path = argv[1];
 
-    printf("Number of threads: %d\n",NUM_CORES);
+        if (!is_image_path(img_path)) {
+            fprintf(stderr,
+                    "Error: '%s' is not a supported image file "
+                    "(.jpg, .jpeg, .png).\n"
+                    "Usage: %s [image.jpg|image.png]\n",
+                    img_path, argv[0]);
+            return BAD_USAGE;
+        }
 
-    for (int i=0; i<MAX_ITERATIONS; i++)
-        elapsed_time += goldstein_phase_unwrapping("peaks.1024x1024", data_path, type, 1024, 1024, mask_flag);
+        /* Output prefix = input path with extension stripped */
+        char output_prefix[PATH_MAX];
+        strncpy(output_prefix, img_path, sizeof(output_prefix) - 1);
+        output_prefix[sizeof(output_prefix) - 1] = '\0';
+        char *dot = strrchr(output_prefix, '.');
+        if (dot) *dot = '\0';
 
-    elapsed_time /= (double)MAX_ITERATIONS;
-    printf("\nAverage elapsed time: %f ms\n", elapsed_time);
+        elapsed_time = goldstein_phase_unwrapping(
+            img_path, output_prefix,
+            type,
+            0, 0,       /* xsize/ysize auto-detected from image */
+            mask_flag);
+
+        printf("\nElapsed time: %f ms\n", elapsed_time);
+
+    } else {
+        /* ---- Default: built-in binary test data ---- */
+        char data_path[PATH_MAX];
+        char input_path[PATH_MAX];
+        char output_prefix[PATH_MAX];
+        int  MAX_ITERATIONS = 2;
+
+        chdir("..");
+        getcwd(data_path, sizeof(data_path));
+
+        snprintf(input_path,    sizeof(input_path),
+                 "%s/data/peaks.1024x1024.phase", data_path);
+        snprintf(output_prefix, sizeof(output_prefix),
+                 "%s/data/peaks.1024x1024",       data_path);
+
+        for (i = 0; i < MAX_ITERATIONS; i++)
+            elapsed_time += goldstein_phase_unwrapping(
+                input_path, output_prefix,
+                type, 1024, 1024, mask_flag);
+
+        elapsed_time /= (double)MAX_ITERATIONS;
+        printf("\nAverage elapsed time: %f ms\n", elapsed_time);
+    }
 
     return 0;
 }
