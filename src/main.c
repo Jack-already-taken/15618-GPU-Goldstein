@@ -7,16 +7,15 @@
 #include <omp.h>
 #include <limits.h>
 #include <strings.h>   /* strcasecmp */
+#include <getopt.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include "file.h"
 #include "util.h"
 #include "extract.h"
 #include "grad.h"
 #include "pi.h"
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include "tiff_io.h"
 
 
 #define POS_RES     0x01   /* 1st bit */
@@ -32,6 +31,57 @@
 
 int NUM_CORES;
 
+
+/* mkdir -p */
+static int mkdir_p(const char *path)
+{
+    char tmp[PATH_MAX];
+    size_t len;
+    char *p;
+
+    if (!path || !*path)
+        return -1;
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    len = strlen(tmp);
+    while (len > 1 && tmp[len - 1] == '/')
+        tmp[--len] = '\0';
+
+    for (p = tmp + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        if (tmp[0] && mkdir(tmp, 0755) != 0 && errno != EEXIST)
+            return -1;
+        *p = '/';
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+static int path_is_existing_dir(const char *path)
+{
+    struct stat st;
+    if (!path || stat(path, &st) != 0)
+        return 0;
+    return S_ISDIR(st.st_mode);
+}
+
+/* basename without extension, ASCII path assumed */
+static void input_path_stem(const char *input_path, char *stem, size_t stem_sz)
+{
+    const char *slash = strrchr(input_path, '/');
+    const char *base = slash ? slash + 1 : input_path;
+
+    strncpy(stem, base, stem_sz - 1);
+    stem[stem_sz - 1] = '\0';
+    {
+        char *dot = strrchr(stem, '.');
+        if (dot)
+            *dot = '\0';
+    }
+}
 
 double timediff(clock_t t1, clock_t t2) {
     double elapsed;
@@ -315,7 +365,8 @@ int UnwrapAroundCutsFrontier(float *phase,
                              float *grady,
                              float *gradx,
                              int *list,
-                             int length)
+                             int length,
+                             int omp_avoid_pass)
 {
     int    i, j, k, kk, x, y, l, index, n=0, num_pieces=0;
     int    flag, base_in, base_out, top_in, top_out;
@@ -427,32 +478,39 @@ int UnwrapAroundCutsFrontier(float *phase,
 
 
 
-    /* unwrap branch cut pixels */
+    /* unwrap branch cut pixels (AVOID band: branch cuts + border) */
+    if (omp_avoid_pass) {
+        #pragma omp parallel for default(none) \
+        private(i, j, k) \
+        shared(ysize, xsize, bitflags, soln, phase)
+        for (j = 1; j < ysize; j++) {
+            for (i = 1; i < xsize; i++) {
+                k = j * xsize + i;
 
-	#pragma omp parallel for default(none) \
-	private(i, j, k) \
-	shared(ysize, xsize, bitflags, soln, path_order, phase, n)
-    for (j=1; j<ysize; j++)
-    {
-        for (i=1; i<xsize; i++)
-        {
-            k = j*xsize + i;
-
-            if (bitflags[k] & AVOID)
-            {
-                if (!(bitflags[k-1] & AVOID))
-                {
-                    *(soln + k) = *(soln + k - 1) + Gradient(phase[k], phase[k-1]);
+                if (bitflags[k] & AVOID) {
+                    if (!(bitflags[k - 1] & AVOID))
+                        *(soln + k) = *(soln + k - 1) + Gradient(phase[k], phase[k - 1]);
+                    else if (!(bitflags[k - xsize] & AVOID))
+                        *(soln + k) = *(soln + k - xsize)
+                                     + Gradient(phase[k], phase[k - xsize]);
                 }
-                else if (!(bitflags[k-xsize] & AVOID))
-                {
-                	*(soln + k) = *(soln + k - xsize) + Gradient(phase[k], phase[k-xsize]);
+            }
+        }
+    } else {
+        for (j = 1; j < ysize; j++) {
+            for (i = 1; i < xsize; i++) {
+                k = j * xsize + i;
+
+                if (bitflags[k] & AVOID) {
+                    if (!(bitflags[k - 1] & AVOID))
+                        *(soln + k) = *(soln + k - 1) + Gradient(phase[k], phase[k - 1]);
+                    else if (!(bitflags[k - xsize] & AVOID))
+                        *(soln + k) = *(soln + k - xsize)
+                                     + Gradient(phase[k], phase[k - xsize]);
                 }
             }
         }
     }
-
-
 
     return num_pieces;
 }
@@ -745,7 +803,6 @@ void GoldsteinBranchCuts_serial(unsigned char *bitflags,
     AllocateInt(&active_list, max_active + 1, "book keeping data");
 
     /* branch cuts */
-    printf("Computing branch cuts\n");
 
     for (j=0; j<ysize; j++)
     {
@@ -938,96 +995,68 @@ int Residues_serial(float *phase,
 
 
 /* -----------------------------------------------------------------------
- *  Image I/O helpers  (stb_image / stb_image_write)
+ *  Image I/O helpers  (float / uint8 TIFF via tiff_io.cpp: CImg + libtiff)
  * -------------------------------------------------------------------- */
 
-/* Return 1 if path has a .jpg, .jpeg, or .png extension (case-insensitive). */
-static int is_image_path(const char *path)
+/* Return 1 if path has a .tif / .tiff extension (case-insensitive). */
+static int is_tiff_path(const char *path)
 {
     const char *ext = strrchr(path, '.');
     if (!ext) return 0;
-    return (strcasecmp(ext, ".jpg")  == 0 ||
-            strcasecmp(ext, ".jpeg") == 0 ||
-            strcasecmp(ext, ".png")  == 0);
+    return (strcasecmp(ext, ".tif")  == 0 ||
+            strcasecmp(ext, ".tiff") == 0);
 }
 
 /*
- * Load a JPG or PNG file as normalised [0,1] float phase data.
- * Multi-channel images are automatically converted to grayscale.
- * *xsize and *ysize are set to image width and height.
- * Returns a malloc'd float array (caller must free), or exits on error.
+ * Load float32 wrapped phase from TIFF (radians, principal ~[-PI, PI]).
  */
-static float *load_phase_from_image(const char *path, int *xsize, int *ysize)
+static float *load_phase_from_tiff(const char *path, int *xsize, int *ysize)
 {
-    int channels, k, length;
+    int length;
     float *phase;
 
-    /* Force 1-channel (grayscale) output regardless of the source format */
-    unsigned char *img = stbi_load(path, xsize, ysize, &channels, 1);
+    float *img = tiff_io_load_float(path, xsize, ysize);
     if (!img) {
-        fprintf(stderr, "Error: cannot load image '%s': %s\n",
-                path, stbi_failure_reason());
+        fprintf(stderr, "Error: cannot load TIFF '%s'\n", path);
         exit(FILE_OPEN_ERROR);
     }
 
     length = (*xsize) * (*ysize);
-    AllocateFloat(&phase, length, "phase from image");
+    AllocateFloat(&phase, length, "phase from TIFF");
+    memcpy(phase, img, (size_t)length * sizeof(float));
+    free(img);
 
-    /* Map pixel values [0, 255] -> [0, 1] (wrapped phase normalised) */
-    for (k = 0; k < length; k++)
-        phase[k] = img[k] / 255.0f;
-
-    stbi_image_free(img);
-    printf("Loaded image '%s' (%d x %d, %d ch -> grayscale)\n",
-           path, *xsize, *ysize, channels);
+    printf("Loaded TIFF '%s' (%d x %d, float32 rad)\n",
+           path, *xsize, *ysize);
     return phase;
 }
 
-/*
- * Save a float array as a normalised grayscale PNG.
- * The full value range is linearly mapped to [0, 255].
- */
-static void save_float_as_png(const char *path, const float *data,
+/* Save unwrapped phase as float32 TIFF (radians, same dynamic range as soln). */
+static void save_float_as_tiff(const char *path, const float *data,
                                int xsize, int ysize)
 {
-    int k, length = xsize * ysize;
-    float rmin = data[0], rmax = data[0];
-    unsigned char *out;
-
-    for (k = 1; k < length; k++) {
-        if (data[k] < rmin) rmin = data[k];
-        if (data[k] > rmax) rmax = data[k];
-    }
-    float scale = (rmax > rmin) ? 255.0f / (rmax - rmin) : 1.0f;
-
-    out = (unsigned char *)malloc(length);
-    for (k = 0; k < length; k++)
-        out[k] = (unsigned char)((data[k] - rmin) * scale);
-
-    if (!stbi_write_png(path, xsize, ysize, 1, out, xsize))
-        fprintf(stderr, "Warning: failed to write PNG '%s'\n", path);
+    if (tiff_io_save_float(path, data, xsize, ysize) != 0)
+        fprintf(stderr, "Warning: failed to write float TIFF '%s'\n", path);
     else
         printf("Saved '%s'\n", path);
-    free(out);
 }
 
 /*
- * Save a byte array as a binary (black/white) PNG.
+ * Save a byte visualization as single-channel 8-bit TIFF.
  * Pixels whose bits overlap mask_code are written as 255, others as 0.
- * If mask_code == 0 every non-zero byte becomes 255.
  */
-static void save_byte_as_png(const char *path, const unsigned char *data,
-                              int xsize, int ysize, int mask_code)
+static void save_byte_as_tiff(const char *path, const unsigned char *data,
+                               int xsize, int ysize, int mask_code)
 {
     int k, length = xsize * ysize;
     unsigned char mask = mask_code ? (unsigned char)mask_code : 0xFF;
-    unsigned char *out = (unsigned char *)malloc(length);
+    unsigned char *out = (unsigned char *)malloc((size_t)length);
 
     for (k = 0; k < length; k++)
         out[k] = (data[k] & mask) ? 255 : 0;
 
-    if (!stbi_write_png(path, xsize, ysize, 1, out, xsize))
-        fprintf(stderr, "Warning: failed to write PNG '%s'\n", path);
+    if (tiff_io_save_u8(path, out, xsize, ysize) != 0)
+        fprintf(stderr, "Warning: failed to write uint8 TIFF '%s'\n", path);
     else
         printf("Saved '%s'\n", path);
     free(out);
@@ -1035,34 +1064,179 @@ static void save_byte_as_png(const char *path, const unsigned char *data,
 
 
 /* -----------------------------------------------------------------------
+ *  Ground-truth comparison helpers
+ * -------------------------------------------------------------------- */
+
+static int parse_json_range(const char *json_path, double *lo, double *hi)
+{
+    FILE *fp = fopen(json_path, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: cannot open JSON '%s'\n", json_path);
+        return -1;
+    }
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+
+    int found_lo = 0, found_hi = 0;
+    char *p;
+
+    p = strstr(buf, "\"true_lo\"");
+    if (p) {
+        p = strchr(p + 9, ':');
+        if (p) { *lo = strtod(p + 1, NULL); found_lo = 1; }
+    }
+    p = strstr(buf, "\"true_hi\"");
+    if (p) {
+        p = strchr(p + 9, ':');
+        if (p) { *hi = strtod(p + 1, NULL); found_hi = 1; }
+    }
+
+    if (!found_lo || !found_hi) {
+        fprintf(stderr, "Error: could not find true_lo/true_hi in '%s'\n",
+                json_path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Min/max of float array (for logging when JSON sidecar is absent). */
+static void float_range_stats(const float *a, int n, double *lo, double *hi)
+{
+    int k;
+    double mn = (double)a[0], mx = (double)a[0];
+    for (k = 1; k < n; k++) {
+        double v = (double)a[k];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    *lo = mn;
+    *hi = mx;
+}
+
+/*
+ * Ground truth: single-channel float32 TIFF, values already in radians
+ * (same convention as Python generate_phase.save_case).
+ */
+static float *load_ground_truth_tiff(const char *path,
+                                     int expected_w, int expected_h)
+{
+    int w, h;
+    float *truth = tiff_io_load_float(path, &w, &h);
+
+    if (!truth) {
+        fprintf(stderr, "Error: cannot load ground-truth TIFF '%s'\n", path);
+        return NULL;
+    }
+    if (w != expected_w || h != expected_h) {
+        fprintf(stderr,
+                "Error: ground truth size %dx%d != input size %dx%d\n",
+                w, h, expected_w, expected_h);
+        free(truth);
+        return NULL;
+    }
+
+    printf("Loaded ground truth '%s' (%d x %d), float32 radians (TIFF)\n",
+           path, w, h);
+    return truth;
+}
+
+static double compute_rms(const float *result, const float *truth, int length)
+{
+    int k;
+    double sum_diff = 0.0, offset, sum_sq = 0.0, d;
+
+    for (k = 0; k < length; k++)
+        sum_diff += (double)(result[k] - truth[k]);
+    offset = sum_diff / length;
+
+    for (k = 0; k < length; k++) {
+        d = (double)(result[k] - truth[k]) - offset;
+        sum_sq += d * d;
+    }
+    return sqrt(sum_sq / length);
+}
+
+
+/* Bitwise compare for parallel-vs-serial verification (masked flags only). */
+static int count_flag_mismatch(const unsigned char *a, const unsigned char *b,
+                               int n, unsigned char mask)
+{
+    int k, bad = 0;
+    for (k = 0; k < n; k++)
+        if ((a[k] & mask) != (b[k] & mask))
+            ++bad;
+    return bad;
+}
+
+
+/* Compare two unwrapped solutions (radians). */
+static void soln_diff_stats(const float *a, const float *b, int n,
+                            double *max_abs, int *n_gt_tol, float tol)
+{
+    int k;
+    double mx = 0.0;
+    int cnt = 0;
+
+    for (k = 0; k < n; k++) {
+        double d = fabs((double)a[k] - (double)b[k]);
+        if (d > mx)
+            mx = d;
+        if ((float)d > tol)
+            ++cnt;
+    }
+    *max_abs = mx;
+    *n_gt_tol = cnt;
+}
+
+
+/* -----------------------------------------------------------------------
  *  Core phase-unwrapping pipeline
  *
  *  input_path    – full path to the input file.
- *                  Supported: .jpg / .jpeg / .png  (loaded via stb_image;
- *                             dimensions auto-detected, xsize/ysize ignored)
+ *                  Supported: .tif / .tiff  (float32 wrapped phase, radians;
+ *                             principal ~[-PI, PI]; xsize/ysize auto-detected)
  *                             any other extension   (raw binary read via
  *                             GetPhase; xsize and ysize must be provided)
  *
- *  output_prefix – path prefix used for all output files (no extension).
- *                  Example: "/data/peaks" produces peaks.res, peaks.out …
- *                  For image inputs an additional *_unwrapped.png is written.
+ *  output_prefix – path prefix used for output files (no extension).
+ *                  Always writes *_unwrapped.tif (float32 radians).
+ *                  With verify_serial: also *_residues.tif and *_branchcuts.tif.
  *
  *  type          – binary-format selector passed to GetPhase (ignored for
  *                  image inputs):
  *                    0 = 8-byte complex,  1 = 4-byte complex,
  *                    2 = 1-byte quantised phase,  3 = 4-byte float phase
  *
- *  xsize, ysize  – dimensions for binary inputs; pass 0 for image inputs
- *                  (values are filled in by load_phase_from_image).
+ *  xsize, ysize  – dimensions for binary inputs; pass 0 for TIFF inputs
+ *                  (values are filled in by load_phase_from_tiff).
  *
  *  mask_flag     – 1 = load a mask from <output_prefix>.mask
+ *
+ *  gt_path       – path to float32 ground-truth TIFF in radians (or NULL).
+ *  gt_lo, gt_hi  – optional metadata from JSON (for logging only; RMS uses
+ *                  samples read directly from the TIFF).
+ *  gt_json_valid – 1 if true_lo/true_hi were read from JSON successfully.
+ *  verify_serial  – if non-zero, compare parallel pipeline vs serial references
+ *                   at residues, branch cuts (serial vs 1-thread parallel),
+ *                   and unwrap (OMP vs serial AVOID-band pass).
+ *
+ *  Return value  – elapsed ms for the parallel kernel only (residue detect +
+ *                  Goldstein branch cuts + frontier unwrap).  Disk I/O, RMS,
+ *                  and verify_serial work are timed separately (outside).
  * -------------------------------------------------------------------- */
 double goldstein_phase_unwrapping(const char *input_path,
                                    const char *output_prefix,
                                    int type,
                                    int xsize,
                                    int ysize,
-                                   int mask_flag)
+                                   int mask_flag,
+                                   const char *gt_path,
+                                   double gt_lo,
+                                   double gt_hi,
+                                   int gt_json_valid,
+                                   int verify_serial)
 {
     int           *path_order;
     float         *phase;
@@ -1072,17 +1246,24 @@ double goldstein_phase_unwrapping(const char *input_path,
     unsigned char *unwrap, *bitflags;
     clock_t        t1, t2;
     double         elapsed_time;
-    FILE          *ifp, *ofp, *ifm;
+    FILE          *ifp, *ifm;
     char           fname[PATH_MAX];
     int            k, length, num_pieces, NumRes, MaxCutLen;
     int            *list;
+    int            mis_res = 0, mis_brc = 0, n_soln_bad = 0, saved_nc = 0;
+    double         soln_max_abs = 0.0;
+    unsigned char *bf_res_ser = NULL, *bf_brc_ser = NULL, *bf_brc_1t = NULL;
+    unsigned char *bf_preunwrap = NULL, *bf_unwrap2 = NULL;
+    unsigned char *snap_after_res = NULL;
+    float          *soln_ser = NULL;
+    int            *path_order_ser = NULL;
 
-    int is_img = is_image_path(input_path);
+    int is_tiff = is_tiff_path(input_path);
 
-    /* ---- For image inputs load now to discover dimensions ---- */
+    /* ---- For TIFF inputs load now to discover dimensions ---- */
     float *img_phase = NULL;
-    if (is_img) {
-        img_phase = load_phase_from_image(input_path, &xsize, &ysize);
+    if (is_tiff) {
+        img_phase = load_phase_from_tiff(input_path, &xsize, &ysize);
     }
 
     /* ---- Allocate working arrays ---- */
@@ -1111,7 +1292,7 @@ double goldstein_phase_unwrapping(const char *input_path,
     }
 
     /* ---- Read phase ---- */
-    if (is_img) {
+    if (is_tiff) {
         /* Transfer the pre-loaded data and release the temporary buffer */
         memcpy(phase, img_phase, length * sizeof(float));
         free(img_phase);
@@ -1134,60 +1315,146 @@ double goldstein_phase_unwrapping(const char *input_path,
     /* ---- Pre-compute x/y gradients ---- */
     Gradxy(phase, gradx, grady, xsize, ysize);
 
-    /* ======= START TIMING ======= */
-    t1 = clock();
-
-    /* ---- Locate residues ---- */
-    NumRes = Residues_parallel(phase, bitflags, xsize, ysize);
-    printf("Number of residues: %d\n", NumRes);
-
-    snprintf(fname, sizeof(fname), "%s.res", output_prefix);
-    SaveByteToImage(bitflags, "residues", fname, xsize, ysize, 1, 1, 0);
-    if (is_img) {
-        snprintf(fname, sizeof(fname), "%s_residues.png", output_prefix);
-        save_byte_as_png(fname, bitflags, xsize, ysize, RESIDUE);
-    }
-
-    /* ---- Generate branch cuts ---- */
     MaxCutLen = (xsize + ysize) / 2;
-    GoldsteinBranchCuts_parallel(bitflags, MaxCutLen, NumRes, xsize, ysize);
 
-    snprintf(fname, sizeof(fname), "%s.brc", output_prefix);
-    SaveByteToImage(bitflags, "branch cuts", fname,
-                    xsize, ysize, 1, 1, BRANCH_CUT | BORDER);
-    if (is_img) {
-        snprintf(fname, sizeof(fname), "%s_branchcuts.png", output_prefix);
-        save_byte_as_png(fname, bitflags, xsize, ysize, BRANCH_CUT | BORDER);
+    if (verify_serial) {
+        snap_after_res = (unsigned char *)malloc((size_t)length);
+        if (!snap_after_res)
+            fprintf(stderr,
+                    "Warning: verify_serial: residue snapshot malloc failed.\n");
+        bf_preunwrap = (unsigned char *)malloc((size_t)length);
+        bf_unwrap2 = (unsigned char *)malloc((size_t)length);
+        soln_ser = (float *)malloc((size_t)length * sizeof(float));
+        path_order_ser = (int *)malloc((size_t)length * sizeof(int));
+        if (!bf_preunwrap || !bf_unwrap2 || !soln_ser || !path_order_ser) {
+            fprintf(stderr, "verify_serial: malloc failed (unwrap buffers)\n");
+            free(bf_preunwrap);
+            free(bf_unwrap2);
+            free(soln_ser);
+            free(path_order_ser);
+            bf_preunwrap = NULL;
+            bf_unwrap2 = NULL;
+            soln_ser = NULL;
+            path_order_ser = NULL;
+        }
     }
 
-    /* ---- Unwrap around cuts ---- */
+    /* ---- Timed: OpenMP residues, branch cuts, frontier unwrap ---- */
+    t1 = clock();
+    NumRes = Residues_parallel(phase, bitflags, xsize, ysize);
+    if (verify_serial && snap_after_res)
+        memcpy(snap_after_res, bitflags, (size_t)length);
+    GoldsteinBranchCuts_parallel(bitflags, MaxCutLen, NumRes, xsize, ysize);
+    if (verify_serial && bf_preunwrap)
+        memcpy(bf_preunwrap, bitflags, (size_t)length);
     num_pieces = UnwrapAroundCutsFrontier(phase, bitflags, soln,
                                           xsize, ysize, path_order,
-                                          grady, gradx, list, length);
-
-    /* ======= END TIMING ======= */
+                                          grady, gradx, list, length, 1);
     t2 = clock();
     elapsed_time = timediff(t1, t2);
 
+    printf("Number of residues: %d\n", NumRes);
+
+    if (verify_serial) {
+        bf_res_ser = (unsigned char *)malloc((size_t)length);
+        if (bf_res_ser && snap_after_res) {
+            for (k = 0; k < length; k++)
+                bf_res_ser[k] = (mask[k] == 0.0f) ? BORDER : 0;
+            Residues_serial(phase, bf_res_ser, xsize, ysize);
+            mis_res = count_flag_mismatch(snap_after_res, bf_res_ser, length,
+                                          (unsigned char)(POS_RES | NEG_RES));
+        }
+        free(bf_res_ser);
+        bf_res_ser = NULL;
+
+        bf_brc_ser = (unsigned char *)malloc((size_t)length);
+        bf_brc_1t = (unsigned char *)malloc((size_t)length);
+        if (bf_brc_ser && bf_brc_1t && snap_after_res) {
+            memcpy(bf_brc_ser, snap_after_res, (size_t)length);
+            GoldsteinBranchCuts_serial(bf_brc_ser, MaxCutLen, NumRes, xsize, ysize);
+
+            memcpy(bf_brc_1t, snap_after_res, (size_t)length);
+            saved_nc = NUM_CORES;
+            NUM_CORES = 1;
+            omp_set_num_threads(1);
+            GoldsteinBranchCuts_parallel(bf_brc_1t, MaxCutLen, NumRes, xsize, ysize);
+            NUM_CORES = saved_nc;
+            omp_set_num_threads(NUM_CORES);
+
+            mis_brc = count_flag_mismatch(
+                bf_brc_1t, bf_brc_ser, length,
+                (unsigned char)(BRANCH_CUT | BORDER | POS_RES | NEG_RES));
+        }
+        free(bf_brc_ser);
+        bf_brc_ser = NULL;
+        free(bf_brc_1t);
+        bf_brc_1t = NULL;
+
+        if (bf_preunwrap && bf_unwrap2 && soln_ser && path_order_ser) {
+            memset(soln_ser, 0, (size_t)length * sizeof(float));
+            memset(path_order_ser, 0, (size_t)length * sizeof(int));
+            memcpy(bf_unwrap2, bf_preunwrap, (size_t)length);
+            UnwrapAroundCutsFrontier(phase, bf_unwrap2, soln_ser,
+                                     xsize, ysize, path_order_ser,
+                                     grady, gradx, list, length, 0);
+            soln_diff_stats(soln, soln_ser, length, &soln_max_abs, &n_soln_bad, 1e-5f);
+
+            printf("\n=== Parallel vs serial correctness ===\n");
+            printf("  Residues (POS|NEG) : %s  (%d mismatched cells)\n",
+                   mis_res ? "CHECK" : "PASS", mis_res);
+            printf("  Branch layout      : %s  (%d mismatched cells; "
+                   "GoldsteinBranchCuts_serial vs parallel@1 thread)\n",
+                   mis_brc ? "CHECK" : "PASS", mis_brc);
+            printf("  Unwrap (main vs serial AVOID pass) : %s  "
+                   "(max |Δ| = %.6g, cells > 1e-5: %d)\n",
+                   n_soln_bad ? "CHECK" : "PASS", soln_max_abs, n_soln_bad);
+        }
+    }
+
+    if (verify_serial && snap_after_res) {
+        snprintf(fname, sizeof(fname), "%s_residues.tif", output_prefix);
+        save_byte_as_tiff(fname, snap_after_res, xsize, ysize, RESIDUE);
+    }
+    free(snap_after_res);
+
+    if (verify_serial) {
+        snprintf(fname, sizeof(fname), "%s_branchcuts.tif", output_prefix);
+        save_byte_as_tiff(fname, bitflags, xsize, ysize, BRANCH_CUT | BORDER);
+    }
+
+    free(bf_preunwrap);
+    free(bf_unwrap2);
+    free(soln_ser);
+    free(path_order_ser);
+
     printf("Number of pieces: %d\n", num_pieces);
-    printf("Elapsed time: %f ms\n", elapsed_time);
+    printf("Elapsed time (parallel kernel): %f ms\n", elapsed_time);
 
-    /* ---- Scale solution back to radians ---- */
-    for (k = 0; k < length; k++)
-        soln[k] *= TWOPI;
+    /* ---- Save unwrapped phase (float32 radians) ---- */
+    snprintf(fname, sizeof(fname), "%s_unwrapped.tif", output_prefix);
+    save_float_as_tiff(fname, soln, xsize, ysize);
 
-    /* ---- Save results ---- */
-    snprintf(fname, sizeof(fname), "%s.out", output_prefix);
-    OpenFile(&ofp, fname, "w");
-    WriteFloat(ofp, soln, length, fname);
+    /* ---- RMS test against ground truth (float32 radians TIFF) ---- */
+    if (gt_path) {
+        float *truth = load_ground_truth_tiff(gt_path, xsize, ysize);
+        if (truth) {
+            double rms = compute_rms(soln, truth, length);
+            double tr_lo, tr_hi;
+            float_range_stats(truth, length, &tr_lo, &tr_hi);
 
-    snprintf(fname, sizeof(fname), "%s.path", output_prefix);
-    SaveIntToImage(path_order, "path integration", fname, xsize, ysize);
-
-    /* Normalised PNG of the unwrapped surface for image inputs */
-    if (is_img) {
-        snprintf(fname, sizeof(fname), "%s_unwrapped.png", output_prefix);
-        save_float_as_png(fname, soln, xsize, ysize);
+            printf("=== RMS Test ===\n");
+            printf("  Ground truth : %s\n", gt_path);
+            printf("  File range   : [%.6f, %.6f] rad (float32 TIFF)\n",
+                   tr_lo, tr_hi);
+            if (gt_json_valid)
+                printf("  JSON range   : [%.6f, %.6f] rad (metadata)\n",
+                       gt_lo, gt_hi);
+            printf("  RMS error    : %.6f rad  (%.4f deg)\n",
+                   rms, rms * 180.0 / M_PI);
+            printf("  Method       : mean-offset RMSE vs truth "
+                   "(same as prior uint8-PNG pipeline, without 8-bit decode)\n");
+            free(truth);
+        }
     }
 
     printf("\n");
@@ -1208,65 +1475,189 @@ double goldstein_phase_unwrapping(const char *input_path,
 
 
 
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage:\n"
+        "  %s -i <input.tif> [-g <truth.tif> [-j <meta.json>]] [-m] [-t <threads>] [-v]\n"
+        "  %s                 (default built-in binary test)\n"
+        "\n"
+        "Options:\n"
+        "  -i, --input   <path>   Wrapped phase: float32 TIFF, radians ~[-pi, pi]\n"
+        "  -g, --ground  <path>   Ground truth: float32 radians TIFF (optional RMS)\n"
+        "  -j, --json    <path>   Optional JSON with true_lo / true_hi (metadata)\n"
+        "  -o, --output  <dir>    Output directory for <stem>_unwrapped.tif (mkdir -p).\n"
+        "                         With -v, also <stem>_residues.tif and <stem>_branchcuts.tif.\n"
+        "                         Default: input directory; stem from basename.\n"
+        "  -m, --mask             Enable mask loading (<prefix>.mask)\n"
+        "  -t, --threads <n>      Number of OpenMP threads\n"
+        "  -v, --verify-serial    Compare parallel vs serial; extra work/memory;\n"
+        "                         writes residues/branchcuts debug TIFFs\n"
+        "  -h, --help             Show this help message\n"
+        "\n"
+        "Examples:\n"
+        "  %s -i phase_data/noisy_wrapped.tif\n"
+        "  %s -i phase_data/noisy_wrapped.tif -g phase_data/noisy_true.tif "
+        "-j phase_data/noisy.json\n",
+        prog, prog, prog, prog);
+}
+
+
 int main(int argc, char *argv[])
 {
     int    mask_flag = 0;
-    int    type      = 3;   /* 4-byte float phase for binary inputs */
+    int    type      = 3;
+    int    num_threads = 0;
+    int    verify_serial = 0;
     double elapsed_time = 0.0;
-    int    i;
+    int    i, opt;
 
-    NUM_CORES = omp_get_num_procs() / 2;
-    if (NUM_CORES < 1) NUM_CORES = 1;
+    const char *input_path  = NULL;
+    const char *gt_path     = NULL;
+    const char *json_path   = NULL;
+    const char *out_dir     = NULL;
+
+    static struct option long_opts[] = {
+        {"input",   required_argument, NULL, 'i'},
+        {"ground",  required_argument, NULL, 'g'},
+        {"json",    required_argument, NULL, 'j'},
+        {"output",  required_argument, NULL, 'o'},
+        {"mask",    no_argument,       NULL, 'm'},
+        {"threads", required_argument, NULL, 't'},
+        {"verify-serial", no_argument, NULL, 'v'},
+        {"help",    no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+
+    while ((opt = getopt_long(argc, argv, "i:g:j:o:mt:vh", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'i': input_path  = optarg; break;
+        case 'g': gt_path     = optarg; break;
+        case 'j': json_path   = optarg; break;
+        case 'o': out_dir     = optarg; break;
+        case 'm': mask_flag   = 1;      break;
+        case 't': num_threads = atoi(optarg); break;
+        case 'v': verify_serial = 1;  break;
+        case 'h': print_usage(argv[0]); return 0;
+        default:  print_usage(argv[0]); return BAD_USAGE;
+        }
+    }
+
+    /* Also accept a bare positional argument as the input image (legacy) */
+    if (!input_path && optind < argc)
+        input_path = argv[optind];
+
+    /* ---- Thread setup ---- */
+    if (num_threads <= 0) {
+        NUM_CORES = omp_get_num_procs() / 2;
+        if (NUM_CORES < 1) NUM_CORES = 1;
+    } else {
+        NUM_CORES = num_threads;
+    }
     omp_set_num_threads(NUM_CORES);
     printf("Number of threads: %d\n", NUM_CORES);
 
-    if (argc >= 2) {
-        /* ---- Image mode: path supplied on the command line ---- */
-        const char *img_path = argv[1];
-
-        if (!is_image_path(img_path)) {
+    if (input_path) {
+        /* ---- TIFF image mode ---- */
+        if (!is_tiff_path(input_path)) {
             fprintf(stderr,
-                    "Error: '%s' is not a supported image file "
-                    "(.jpg, .jpeg, .png).\n"
-                    "Usage: %s [image.jpg|image.png]\n",
-                    img_path, argv[0]);
+                    "Error: '%s' is not a supported TIFF file "
+                    "(.tif, .tiff).\n", input_path);
+            print_usage(argv[0]);
             return BAD_USAGE;
         }
 
-        /* Output prefix = input path with extension stripped */
-        char output_prefix[PATH_MAX];
-        strncpy(output_prefix, img_path, sizeof(output_prefix) - 1);
-        output_prefix[sizeof(output_prefix) - 1] = '\0';
-        char *dot = strrchr(output_prefix, '.');
-        if (dot) *dot = '\0';
+        /* Output prefix: default = full input path sans extension; or <out_dir>/<stem> */
+        char default_prefix[PATH_MAX];
+        char out_prefix_buf[PATH_MAX];
+        char stem[PATH_MAX];
+        const char *out_prefix;
+
+        input_path_stem(input_path, stem, sizeof(stem));
+
+        if (!out_dir) {
+            strncpy(default_prefix, input_path, sizeof(default_prefix) - 1);
+            default_prefix[sizeof(default_prefix) - 1] = '\0';
+            {
+                char *dot = strrchr(default_prefix, '.');
+                if (dot)
+                    *dot = '\0';
+            }
+            out_prefix = default_prefix;
+        } else {
+            if (mkdir_p(out_dir) != 0) {
+                fprintf(stderr,
+                        "Error: cannot create output directory '%s': %s\n",
+                        out_dir, strerror(errno));
+                return FILE_WRITE_ERROR;
+            }
+            if (!path_is_existing_dir(out_dir)) {
+                fprintf(stderr,
+                        "Error: -o '%s' is not a directory.\n", out_dir);
+                return BAD_USAGE;
+            }
+            {
+                int n = snprintf(out_prefix_buf, sizeof(out_prefix_buf),
+                                 "%s/%s", out_dir, stem);
+                if (n < 0 || n >= (int)sizeof(out_prefix_buf)) {
+                    fprintf(stderr, "Error: output path too long.\n");
+                    return BAD_USAGE;
+                }
+            }
+            out_prefix = out_prefix_buf;
+        }
+
+        double gt_lo = 0.0, gt_hi = 0.0;
+        int    gt_json_valid = 0;
+
+        if (gt_path) {
+            if (!is_tiff_path(gt_path)) {
+                fprintf(stderr,
+                        "Error: --ground must be a float32 .tif / .tiff file.\n");
+                print_usage(argv[0]);
+                return BAD_USAGE;
+            }
+            if (json_path) {
+                if (parse_json_range(json_path, &gt_lo, &gt_hi) != 0) {
+                    fprintf(stderr,
+                            "Warning: could not parse JSON; "
+                            "RMS still uses float32 TIFF truth.\n");
+                } else {
+                    gt_json_valid = 1;
+                }
+            }
+        } else if (json_path) {
+            fprintf(stderr,
+                    "Warning: --json without --ground is ignored.\n");
+        }
 
         elapsed_time = goldstein_phase_unwrapping(
-            img_path, output_prefix,
+            input_path, out_prefix,
             type,
-            0, 0,       /* xsize/ysize auto-detected from image */
-            mask_flag);
-
-        printf("\nElapsed time: %f ms\n", elapsed_time);
+            0, 0,
+            mask_flag,
+            gt_path, gt_lo, gt_hi, gt_json_valid, verify_serial);
 
     } else {
         /* ---- Default: built-in binary test data ---- */
         char data_path[PATH_MAX];
-        char input_path[PATH_MAX];
-        char output_prefix[PATH_MAX];
+        char bin_input[PATH_MAX];
+        char bin_prefix[PATH_MAX];
         int  MAX_ITERATIONS = 2;
 
         chdir("..");
         getcwd(data_path, sizeof(data_path));
 
-        snprintf(input_path,    sizeof(input_path),
+        snprintf(bin_input,  sizeof(bin_input),
                  "%s/data/peaks.1024x1024.phase", data_path);
-        snprintf(output_prefix, sizeof(output_prefix),
+        snprintf(bin_prefix, sizeof(bin_prefix),
                  "%s/data/peaks.1024x1024",       data_path);
 
         for (i = 0; i < MAX_ITERATIONS; i++)
             elapsed_time += goldstein_phase_unwrapping(
-                input_path, output_prefix,
-                type, 1024, 1024, mask_flag);
+                bin_input, bin_prefix,
+                type, 1024, 1024, mask_flag,
+                NULL, 0.0, 0.0, 0, verify_serial);
 
         elapsed_time /= (double)MAX_ITERATIONS;
         printf("\nAverage elapsed time: %f ms\n", elapsed_time);

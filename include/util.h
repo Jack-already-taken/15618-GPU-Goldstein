@@ -16,17 +16,9 @@ void ReadFloat(FILE *fp, float *data, int len, char *name);
 void ReadDouble(FILE *fp, double *data, int len, char *name);
 void WriteByte(FILE *fp, unsigned char *data, int len, char *name);
 void WriteShort(FILE *fp, short *data, int len, char *name);
-void WriteInt(FILE *fp, int *data, int len, char *name);
-void WriteFloat(FILE *fp, float *data, int len, char *name);
 void WriteDouble(FILE *fp, double *data, int len, char *name);
 void AverageByteToFloat(unsigned char *in, float *out, int tsize,
                         int xsize, int ysize);
-void SaveFloatToImage(float *data, char *what, char *filename,
-          int xsize, int ysize, int neg, int binary, int logflag);
-void SaveByteToImage(unsigned char *im, const char *what, char *filename,
-          int xsize, int ysize, int neg, int binary, int mask_code);
-void SaveIntToImage(int *im, const char *what, char *filename,
-                    int xsize, int ysize);
 int Keyword(char *string, char *keyword);
 int CommandLineParm(int argc, char *argv[], char *key,
   CommandLineParmType type, void *ptr, int required, char *usage);

@@ -1,51 +1,44 @@
 """
-Synthetic wrapped phase image generator for Goldstein branch-cut unwrapping tests.
+Synthetic wrapped phase for the Goldstein unwrapping benchmark.
 
-Generates true phase fields, wraps them to [-pi, pi], and saves both the wrapped
-phase (input to unwrapping) and the true unwrapped phase (ground truth).
+Writes float32 TIFF consumed by src/main.c (wrapped phase in radians,
+principal value (-π, π]; true phase in radians).
 
-Output formats:
-  - .npy   : float32 arrays (recommended for CUDA I/O; load with cnpy or custom reader)
-  - .tiff  : 32-bit float TIFF (OpenCV can read with IMREAD_UNCHANGED)
-  - .png   : 8-bit visualization only (NOT for numerical use)
+Includes residue / noise control via additive Gaussian noise on the raw
+phase before wrapping (``make_noisy``), plus ramp / quadratic / peaks /
+deterministic shear cases — similar to the original PNG-era suite, but TIFF.
 
-Phase field types:
-  - ramp       : smooth linear gradient, zero residues (sanity baseline)
-  - quadratic  : smooth paraboloid, zero residues
-  - peaks      : sum of Gaussians, zero residues in noise-free case
-  - noisy      : smooth field + additive Gaussian noise on wrapped phase
-                 (residue density controlled by noise sigma)
-  - shear      : discontinuity-injected field producing many residues
-                 (residue density controlled by number of shear segments)
-
-Residues arise wherever the 2x2 wrapped-phase circulation is non-zero. Smooth
-fields have zero residues; noise and discontinuities create them.
+Python: ``pip install tifffile`` (or imageio).
 """
 
+from __future__ import annotations
+
 import argparse
+import json
+import math
 import os
+
 import numpy as np
 
 
-# ---------- phase field generators ----------
+# ---------- phase field generators (raw radians) ----------
 
-def field_ramp(h, w, slope_y=4.0, slope_x=6.0):
-    """Linear ramp. Total phase range = slope_y*2pi vertically, slope_x*2pi horizontally."""
+
+def field_ramp(h: int, w: int, slope_y: float = 4.0, slope_x: float = 6.0) -> np.ndarray:
     y = np.linspace(0, slope_y * 2 * np.pi, h, dtype=np.float32)
     x = np.linspace(0, slope_x * 2 * np.pi, w, dtype=np.float32)
     return y[:, None] + x[None, :]
 
 
-def field_quadratic(h, w, scale=8.0):
-    """Paraboloid: scale*2pi at the corners."""
-    y = np.linspace(-1, 1, h, dtype=np.float32)
-    x = np.linspace(-1, 1, w, dtype=np.float32)
+def field_quadratic(h: int, w: int, scale: float = 8.0) -> np.ndarray:
+    y = np.linspace(-1, 1, h, dtype=np.float64)
+    x = np.linspace(-1, 1, w, dtype=np.float64)
     yy, xx = np.meshgrid(y, x, indexing="ij")
-    return (scale * 2 * np.pi) * (xx * xx + yy * yy)
+    v = scale * 2.0 * math.pi * (xx * xx + yy * yy)
+    return v.astype(np.float32)
 
 
-def field_peaks(h, w, n_peaks=5, amplitude=6.0, seed=0):
-    """Sum of Gaussian bumps. Smooth, zero residues in the noise-free limit."""
+def field_peaks(h: int, w: int, n_peaks: int = 5, amplitude: float = 6.0, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     y = np.linspace(-1, 1, h, dtype=np.float32)
     x = np.linspace(-1, 1, w, dtype=np.float32)
@@ -60,198 +53,244 @@ def field_peaks(h, w, n_peaks=5, amplitude=6.0, seed=0):
     return field
 
 
-# ---------- wrapping and residue utilities ----------
-
-def wrap(phi):
-    """Wrap phase to [-pi, pi)."""
-    return np.angle(np.exp(1j * phi)).astype(np.float32)
+def wrap_principal_rad(phi: np.ndarray) -> np.ndarray:
+    p = np.asarray(phi, dtype=np.float64)
+    return np.arctan2(np.sin(p), np.cos(p)).astype(np.float32)
 
 
-def count_residues(wrapped):
-    """
-    Count Goldstein residues on 2x2 cells.
+def count_residues_from_wrapped_rad(wrapped_rad: np.ndarray) -> tuple[int, np.ndarray]:
+    """2×2 residue count; map wrapped radians to [0,1) per Goldstein convention."""
 
-    A residue exists where the sum of wrapped phase differences around a 2x2 loop
-    is not zero. Returns (n_residues, residue_map) where residue_map has +1 / -1
-    at residue cells and 0 elsewhere. Shape is (h-1, w-1).
-    """
     def wdiff(a, b):
-        return wrap(a - b)
+        d = a - b
+        return d - np.round(d)
 
-    # corners of the 2x2 loop
-    p00 = wrapped[:-1, :-1]
-    p01 = wrapped[:-1, 1:]
-    p11 = wrapped[1:, 1:]
-    p10 = wrapped[1:, :-1]
-
+    u = np.mod(np.asarray(wrapped_rad, dtype=np.float64) / (2.0 * np.pi), 1.0)
+    p00 = u[:-1, :-1]
+    p01 = u[:-1, 1:]
+    p11 = u[1:, 1:]
+    p10 = u[1:, :-1]
     s = wdiff(p01, p00) + wdiff(p11, p01) + wdiff(p10, p11) + wdiff(p00, p10)
-    # sum will be approximately 0, +2pi, or -2pi
-    residue = np.round(s / (2 * np.pi)).astype(np.int8)
-    n = int(np.count_nonzero(residue))
-    return n, residue
+    residue = np.round(s).astype(np.int8)
+    return int(np.count_nonzero(residue)), residue
 
 
-# ---------- noise- and discontinuity-driven residue generation ----------
-
-def make_noisy(h, w, base="quadratic", noise_sigma=0.5, seed=0, **kwargs):
-    """
-    Smooth base field + additive noise applied to the wrapped phase.
-    Higher noise_sigma -> higher residue density.
-    Measured on a 512x512 quadratic base:
-        0.50 -> ~0.01% residues (very sparse)
-        0.70 -> ~0.7%           (sparse)
-        1.00 -> ~8%             (moderate)
-        1.30 -> ~19%            (dense)
-        1.60 -> ~27%            (very dense, stress test)
-        2.00+-> ~32% (saturated; residue field approaches random)
-    """
+def make_noisy(
+    h: int,
+    w: int,
+    base: str = "quadratic",
+    noise_sigma: float = 0.5,
+    seed: int = 0,
+    **kwargs: object,
+) -> tuple[np.ndarray, np.ndarray]:
     if base == "ramp":
-        true = field_ramp(h, w, **kwargs)
+        true = field_ramp(h, w, **kwargs)  # type: ignore[arg-type]
     elif base == "quadratic":
-        true = field_quadratic(h, w, **kwargs)
+        true = field_quadratic(h, w, **kwargs)  # type: ignore[arg-type]
     elif base == "peaks":
-        true = field_peaks(h, w, seed=seed, **kwargs)
+        true = field_peaks(h, w, seed=seed, **kwargs)  # type: ignore[arg-type]
     else:
         raise ValueError(f"unknown base field {base}")
 
     rng = np.random.default_rng(seed)
-    wrapped = wrap(true + rng.normal(0.0, noise_sigma, size=true.shape).astype(np.float32))
+    noisy_raw = true + rng.normal(0.0, noise_sigma, size=true.shape).astype(np.float32)
+    wrapped = wrap_principal_rad(noisy_raw)
     return true, wrapped
 
 
-def make_shear(h, w, n_shears=8, shear_strength=np.pi, seed=0):
-    """
-    Smooth quadratic base with injected line discontinuities that create
-    many residues. n_shears controls residue density more directly than noise.
-    """
+def make_shear(h: int, w: int, n_shears: int = 8, shear_strength: float = np.pi, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
     true = field_quadratic(h, w, scale=4.0)
     rng = np.random.default_rng(seed)
     out = true.copy()
 
     for _ in range(n_shears):
-        horizontal = rng.random() < 0.5
-        if horizontal:
+        if rng.random() < 0.5:
             row = rng.integers(h // 8, 7 * h // 8)
             col0 = rng.integers(0, w // 2)
             col1 = rng.integers(w // 2, w)
-            out[row:, col0:col1] += shear_strength
+            out[row:, col0:col1] += np.float32(shear_strength)
         else:
             col = rng.integers(w // 8, 7 * w // 8)
             row0 = rng.integers(0, h // 2)
             row1 = rng.integers(h // 2, h)
-            out[row0:row1, col:] += shear_strength
+            out[row0:row1, col:] += np.float32(shear_strength)
 
-    wrapped = wrap(out)
+    wrapped = wrap_principal_rad(out)
     return out, wrapped
 
 
-# ---------- saving ----------
+def apply_deterministic_shears(
+    phi: np.ndarray, n_shears: int, shear_strength: float = math.pi
+) -> np.ndarray:
+    out = np.asarray(phi, dtype=np.float32).copy()
+    h, w = out.shape
+    if n_shears <= 0:
+        return out
+    for k in range(n_shears):
+        if k % 2 == 0:
+            row = max(1, min(h - 2, (k + 1) * h // (n_shears + 2)))
+            col0, col1 = w // 4, 3 * w // 4
+            if col1 > col0:
+                out[row:, col0:col1] += np.float32(shear_strength)
+        else:
+            col = max(1, min(w - 2, (k + 1) * w // (n_shears + 2)))
+            row0, row1 = h // 4, 3 * h // 4
+            if row1 > row0:
+                out[row0:row1, col:] += np.float32(shear_strength)
+    return out
 
-def save_npy(path, arr):
-    np.save(path, arr.astype(np.float32))
+
+def build_case(h: int, w: int, n_shears: int) -> tuple[np.ndarray, np.ndarray]:
+    base = field_quadratic(h, w, scale=4.0)
+    true_unwrapped = apply_deterministic_shears(base, n_shears)
+    wrapped_rad = wrap_principal_rad(true_unwrapped)
+    return true_unwrapped, wrapped_rad
 
 
-def save_tiff(path, arr):
-    """32-bit float TIFF. Uses tifffile if present, otherwise falls back to OpenCV."""
-    arr = arr.astype(np.float32)
+def save_tiff_float32(path: str, arr: np.ndarray) -> None:
+    data = np.asarray(arr, dtype=np.float32)
+    if data.ndim != 2:
+        raise ValueError("save_tiff_float32 expects a 2-D array")
     try:
         import tifffile
-        tifffile.imwrite(path, arr)
+
+        tifffile.imwrite(path, data, photometric="minisblack")
         return
     except ImportError:
         pass
     try:
-        import cv2
-        cv2.imwrite(path, arr)
-    except ImportError:
-        print(f"[warn] could not save {path}: install tifffile or opencv-python")
+        import imageio.v3 as iio
 
-
-def save_png_visual(path, arr):
-    """8-bit PNG for visual inspection only. Normalizes to full range."""
-    try:
-        import cv2
-    except ImportError:
+        iio.imwrite(path, data, extension=".tif")
         return
-    lo, hi = float(arr.min()), float(arr.max())
-    if hi - lo < 1e-12:
-        vis = np.zeros_like(arr, dtype=np.uint8)
-    else:
-        vis = ((arr - lo) / (hi - lo) * 255.0).astype(np.uint8)
-    cv2.imwrite(path, vis)
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "Install tifffile (pip install tifffile) or imageio to write TIFF"
+    )
 
 
-def save_case(outdir, name, true, wrapped, residue_map, formats):
+def save_case(
+    outdir: str,
+    name: str,
+    true_rad: np.ndarray,
+    wrapped_rad: np.ndarray,
+    *,
+    n_shears: int = 0,
+    noise_sigma: float | None = None,
+    field_type: str = "",
+    seed: int | None = None,
+) -> int:
     os.makedirs(outdir, exist_ok=True)
     stem = os.path.join(outdir, name)
-    if "npy" in formats:
-        save_npy(stem + "_wrapped.npy", wrapped)
-        save_npy(stem + "_true.npy", true)
-    if "tiff" in formats:
-        save_tiff(stem + "_wrapped.tiff", wrapped)
-        save_tiff(stem + "_true.tiff", true)
-    if "png" in formats:
-        save_png_visual(stem + "_wrapped_vis.png", wrapped)
-        save_png_visual(stem + "_true_vis.png", true)
-        save_png_visual(stem + "_residues_vis.png", residue_map.astype(np.float32))
+
+    save_tiff_float32(stem + "_wrapped.tif", wrapped_rad.astype(np.float32))
+    save_tiff_float32(stem + "_true.tif", true_rad.astype(np.float32))
+
+    lo = float(true_rad.min())
+    hi = float(true_rad.max())
+    n_res, _ = count_residues_from_wrapped_rad(wrapped_rad)
+    hh, ww = wrapped_rad.shape
+
+    meta: dict = {
+        "name": name,
+        "height": int(hh),
+        "width": int(ww),
+        "n_shears": int(n_shears),
+        "n_residues": n_res,
+        "residue_density": n_res / float((hh - 1) * (ww - 1)) if hh > 1 and ww > 1 else 0.0,
+        "wrapped_format": "float32; principal wrapped phase in radians (-π, π]",
+        "true_format": "float32; unwrapped absolute phase in radians",
+        "true_lo": lo,
+        "true_hi": hi,
+        "field_type": field_type,
+    }
+    if noise_sigma is not None:
+        meta["noise_sigma"] = float(noise_sigma)
+    if seed is not None:
+        meta["seed"] = int(seed)
+
+    with open(stem + ".json", "w") as f:
+        json.dump(meta, f, indent=2)
+    return n_res
 
 
-# ---------- CLI ----------
-
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--outdir", default="phase_data", help="output directory")
-    p.add_argument("--type", default="noisy",
-                   choices=["ramp", "quadratic", "peaks", "noisy", "shear"],
-                   help="phase field type")
+    p.add_argument(
+        "--type",
+        default="noisy",
+        choices=["ramp", "quadratic", "peaks", "noisy", "shear"],
+    )
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--width", type=int, default=1024)
-    p.add_argument("--noise-sigma", type=float, default=0.5,
-                   help="noise level for --type noisy (controls residue density)")
-    p.add_argument("--n-shears", type=int, default=8,
-                   help="number of discontinuities for --type shear")
+    p.add_argument(
+        "--noise-sigma",
+        type=float,
+        default=0.72,
+        help="Gaussian noise on raw phase (radians) for --type noisy",
+    )
+    p.add_argument("--n-shears", type=int, default=8, help="for --type shear")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--name", default=None, help="base filename (default auto)")
-    p.add_argument("--formats", default="npy,tiff,png",
-                   help="comma-separated: npy,tiff,png")
+    p.add_argument("--name", default=None)
     return p.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
     h, w = args.height, args.width
-    formats = set(f.strip() for f in args.formats.split(","))
 
     if args.type == "ramp":
         true = field_ramp(h, w)
-        wrapped = wrap(true)
+        wrapped = wrap_principal_rad(true)
+        n_shears = 0
+        noise_sigma = None
     elif args.type == "quadratic":
         true = field_quadratic(h, w)
-        wrapped = wrap(true)
+        wrapped = wrap_principal_rad(true)
+        n_shears = 0
+        noise_sigma = None
     elif args.type == "peaks":
         true = field_peaks(h, w, seed=args.seed)
-        wrapped = wrap(true)
+        wrapped = wrap_principal_rad(true)
+        n_shears = 0
+        noise_sigma = None
     elif args.type == "noisy":
-        true, wrapped = make_noisy(h, w, base="quadratic",
-                                   noise_sigma=args.noise_sigma, seed=args.seed)
+        true, wrapped = make_noisy(
+            h, w, base="quadratic", noise_sigma=args.noise_sigma, seed=args.seed
+        )
+        n_shears = 0
+        noise_sigma = args.noise_sigma
     elif args.type == "shear":
         true, wrapped = make_shear(h, w, n_shears=args.n_shears, seed=args.seed)
+        n_shears = args.n_shears
+        noise_sigma = None
     else:
         raise ValueError(args.type)
 
-    n_res, res_map = count_residues(wrapped)
-    total_cells = (h - 1) * (w - 1)
-    density = n_res / total_cells
-
     name = args.name or f"{args.type}_{h}x{w}_seed{args.seed}"
-    save_case(args.outdir, name, true, wrapped, res_map, formats)
+    n_res = save_case(
+        args.outdir,
+        name,
+        true,
+        wrapped,
+        n_shears=n_shears,
+        noise_sigma=noise_sigma,
+        field_type=args.type,
+        seed=args.seed,
+    )
 
+    density = n_res / float((h - 1) * (w - 1)) if h > 1 and w > 1 else 0.0
     print(f"[ok] {name}")
-    print(f"     size         : {h} x {w}")
-    print(f"     residues     : {n_res} ({density*100:.4f}% of 2x2 cells)")
-    print(f"     wrapped range: [{wrapped.min():.3f}, {wrapped.max():.3f}]")
-    print(f"     true range   : [{true.min():.3f}, {true.max():.3f}]")
-    print(f"     saved to     : {os.path.abspath(args.outdir)}")
+    print(f"     size          : {h} x {w}")
+    print(f"     field         : {args.type}")
+    print(f"     residues      : {n_res} ({density * 100:.4f}% of 2x2 cells)")
+    print(f"     wrapped (rad) : [{wrapped.min():.4f}, {wrapped.max():.4f}]")
+    print(f"     true (rad)    : [{true.min():.3f}, {true.max():.3f}]")
+    print(f"     saved to      : {os.path.abspath(args.outdir)}")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@
  *              2 for 1-byte phase data,
  *              3 for 4-byte float phase data
  *
- *  Output: normalized (0 - 1) phase values in array "phase" 
+ *  Output: wrapped phase in radians (principal ~[-PI, PI]) in "phase"
  */
 void GetPhase(int in_format, FILE *ifp, char *infile, float *phase,
               int xsize, int ysize)
@@ -54,7 +54,6 @@ void ExtractPhase(int in_format, void *in_data, float *phase,
 {
   int            i, j;
   double         x, y, r, angle;
-  static double  one_over_twopi = 1.0/TWOPI;
   static double  scale;
   float          *in8_data = (float *)in_data;
   short          *in4_data = (short *)in_data;
@@ -81,24 +80,18 @@ void ExtractPhase(int in_format, void *in_data, float *phase,
         x *= r;
         y *= r;
         angle = atan2((double)y, (double)x);
-        if (angle < 0) angle += TWOPI;
-        if (angle >= TWOPI) angle -= TWOPI;
-        angle *= one_over_twopi;
-        phase[j*xsize + i] = angle;
+        phase[j*xsize + i] = (float)angle;
       }
     }
   }
   else if (in_format==2) {     /* quantized phase */
-    scale = 1.0/256.0;
+    scale = TWOPI / 256.0;
     for (j=0; j<xsize*ysize; j++) {
-      phase[j] = quantized_phase[j]*scale;
+      phase[j] = (float)(quantized_phase[j] * scale);
     }
   }
-  else {    /* 4-byte float phase */
-    scale = one_over_twopi;
-    for (j=0; j<xsize*ysize; j++) { 
-      /* re-scale phase to interval (0,1) */
-      phase[j] = float_phase[j]*scale;
-    }
+  else {    /* 4-byte float phase (radians) */
+    for (j=0; j<xsize*ysize; j++)
+      phase[j] = float_phase[j];
   }
 }

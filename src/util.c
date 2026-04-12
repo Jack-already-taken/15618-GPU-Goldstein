@@ -151,100 +151,12 @@ void WriteShort(FILE *fp, short *data, int len, char *name)
   fclose(fp);
 }
 
-/* Write array of integers */
-void WriteInt(FILE *fp, int *data, int len, char *name)
-{
-  if (len != fwrite(data, sizeof(int), len, fp))
-    ErrorHandler("File write error", name, FILE_WRITE_ERROR);
-  fclose(fp);
-}
-
-/* Write array of floats */
-void WriteFloat(FILE *fp, float *data, int len, char *name)
-{
-  if (len != fwrite(data, sizeof(float), len, fp))
-    ErrorHandler("File write error", name, FILE_WRITE_ERROR);
-  fclose(fp);
-}
-
 /* Write array of doubles */
 void WriteDouble(FILE *fp, double *data, int len, char *name)
 {
   if (len != fwrite(data, sizeof(double), len, fp))
     ErrorHandler("File write error", name, FILE_WRITE_ERROR);
   fclose(fp);
-}
-
-/* Save an array of bytes in a file.  If neg = 1, reverse   */
-/* the values (like photographic negative).  If binary = 1, */
-/* save values as 0's and 255's (black and white binary     */
-/* image).  If mask_code is not 0, then ignore the pixels   */
-/* that are marked with the bits defined by mask_code.      */
-void SaveByteToImage(unsigned char *im, const char *what, char *filename,
-           int xsize, int ysize, int neg, int binary, int mask_code)
-{
-  int  k;
-  FILE *fp;
-  unsigned char *out, mask;
-  printf("Saving %s to file %s\n", what, filename);
-  AllocateByte(&out, xsize*ysize, "byte array");
-  mask = (mask_code) ? mask_code : 0xFF;     /* bits all 1's */
-  for (k=0; k<xsize*ysize; k++) {
-    if (binary)
-      out[k] = ((neg && !(im[k]&mask))
-                       || (!neg && (im[k]&mask))) ? 255 : 0;
-    else
-      out[k] = (neg) ? 255 - (im[k]&mask) : (im[k]&mask);
-  }
-  OpenFile(&fp, filename, "wb");
-  WriteByte(fp, out, xsize*ysize, filename);
-  free(out);
-}
-
-
-
-/*                                              */
-/*        Save an array of int in a file.       */
-/*                                              */
-/*                                              */
-void SaveIntToImage(int *im, const char *what, char *filename,
-                     int xsize, int ysize)
-{
-    FILE *fp;
-
-    printf("Saving %s to file %s\n", what, filename);
-    OpenFile(&fp, filename, "wb");
-    WriteInt(fp, im, xsize*ysize, filename);
-}
-
-
-/* Scale the floating-point array to 0-255 (byte array),    */
-/* and then save values in a file.  If neg = 1, reverse     */
-/* the values (like photographic negative).  If binary = 1, */
-/* save values as 0's and 255's (black and white binary     */
-/* image).  If logflag = 1, then perform a log-linear       */
-/* scaling on the data (useful for "brightening" images).   */
-void SaveFloatToImage(float *data, char *what, char *filename,
-           int xsize, int ysize, int neg, int binary, int logflag)
-{
-  int  k;
-  unsigned char *im;
-  double  r, rmin, rmax, rscale;
-  AllocateByte(&im, xsize*ysize, "byte array");
-  for (rmin=1.0e+10, rmax=-1.0e+10, k=0; k<xsize*ysize; k++) {
-    if (rmin > data[k]) rmin = data[k];
-    if (rmax < data[k]) rmax = data[k];
-  }
-  if (logflag)
-    r = (rmin==rmax) ? 1.0 : 255.0/log(1.0 + rmax - rmin);
-  else
-    r = (rmin==rmax) ? 1.0 : 255.0/(rmax - rmin);
-  printf("Min & max of %s = %lf %lf\n", what, rmin, rmax);
-  for (k=0; k<xsize*ysize; k++)
-    im[k] = (logflag) ? r*log(1.0 + data[k] - rmin)
-                                    : r*(data[k] - rmin);
-  SaveByteToImage(im, what, filename, xsize, ysize, neg, binary, 0);
-  free(im);
 }
 
 /* Averages byte values and scale from 0-255 to 0-1.  Store      */

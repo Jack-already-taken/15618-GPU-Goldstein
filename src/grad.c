@@ -5,12 +5,15 @@
 #include <stdio.h>
 #include <math.h>
 #include "grad.h"
-/* return wrapped phase difference */
+#include "pi.h"
+
+/* Wrapped phase difference (radians); p1,p2 principal in ~[-PI, PI]. */
 float Gradient(float p1, float p2)
 {
-  float  r;
-  r = p1 - p2;
-  if (r > 0.5) r -= 1.0;
-  if (r < -0.5) r += 1.0;
+  float r = p1 - p2;
+  if (r > (float)PI)
+    r -= (float)TWOPI;
+  else if (r < -(float)PI)
+    r += (float)TWOPI;
   return r;
 }
