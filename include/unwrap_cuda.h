@@ -7,8 +7,14 @@ extern "C" {
 
 /** Device pointers for unwrap stages; allocated by unwrap_cuda_device_bufs_alloc. */
 typedef struct UnwrapCudaDeviceBufs {
+    // Stage 1: Residue Identification
     float          *d_phase;
     unsigned char  *d_bitflags;
+    // Stage 2: Residue Matching
+    int            *d_pos_residues;
+    int            *d_neg_residues;
+    int            *d_pairs;
+    
     float          *d_soln;
     int            *d_residue_count;
 } UnwrapCudaDeviceBufs;
