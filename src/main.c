@@ -16,6 +16,7 @@
 #include "grad.h"
 #include "pi.h"
 #include "tiff_io.h"
+#include "unwrap_cuda.h"
 
 
 #define POS_RES     0x01   /* 1st bit */
@@ -1198,7 +1199,8 @@ static void soln_diff_stats(const float *a, const float *b, int n,
  *                                frontier unwrap (omp_avoid_pass = 1).
  *  UNWRAP_BACKEND_SERIAL_CPU   — Serial residues + serial branch cuts +
  *                                frontier unwrap (omp_avoid_pass = 0).
- *  UNWRAP_BACKEND_CUDA_STUB    — Placeholder for a future CUDA path (no work).
+ *  UNWRAP_BACKEND_CUDA_STUB    — CPU residues, branch cuts, and unwrap; CUDA used
+ *                                only for the residue-matching launch (device hook).
  * -------------------------------------------------------------------- */
 
 #define UNWRAP_BACKEND_PARALLEL_CPU 0
@@ -1207,16 +1209,17 @@ static void soln_diff_stats(const float *a, const float *b, int n,
 #define UNWRAP_BACKEND_COUNT        3
 
 typedef struct UnwrapKernelCtx {
-    float          *phase;
-    unsigned char  *bitflags;
-    float          *soln;
-    int             xsize;
-    int             ysize;
-    int             length;
-    int            *path_order;
-    float          *grady;
-    float          *gradx;
-    int            *list;
+    float                 *phase;
+    unsigned char         *bitflags;
+    float                 *soln;
+    int                    xsize;
+    int                    ysize;
+    int                    length;
+    int                   *path_order;
+    float                 *grady;
+    float                 *gradx;
+    int                   *list;
+    UnwrapCudaDeviceBufs   cuda_dev;
 } UnwrapKernelCtx;
 
 typedef struct UnwrapKernelResult {
@@ -1285,7 +1288,7 @@ static void run_unwrap_kernel_serial_cpu(
     out->elapsed_ms = timediff(t1, t2);
 }
 
-static void run_unwrap_kernel_cuda_stub(
+static void run_unwrap_kernel_cuda(
     UnwrapKernelCtx *ctx,
     int verify_effective,
     unsigned char *snap_after_res,
@@ -1293,31 +1296,51 @@ static void run_unwrap_kernel_cuda_stub(
     UnwrapKernelResult *out)
 {
     clock_t t1, t2;
-
-    (void)verify_effective;
-    (void)snap_after_res;
-    (void)bf_preunwrap;
+    int      MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
     t1 = clock();
-    fprintf(stderr,
-            "unwrap backend 'cuda': not implemented (stub; soln cleared).\n");
-    memset(ctx->soln, 0, (size_t)ctx->length * sizeof(float));
-    out->num_residues = 0;
-    out->num_pieces   = 0;
+
+    /* Residues: CPU (serial), same as serial_cpu backend. */
+    out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+                                        ctx->xsize, ctx->ysize);
+
+    if (verify_effective && snap_after_res)
+        memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
+
+    /* Residue matching: CUDA only (uses d_bitflags); skipped if alloc failed. */
+    if (ctx->cuda_dev.d_bitflags)
+        unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
+                                            out->num_residues, ctx->xsize, ctx->ysize,
+                                            ctx->length);
+    else
+        fprintf(stderr,
+                "unwrap backend 'cuda': no d_bitflags; skipping CUDA residue-matching "
+                "kernel.\n");
+
+    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
+                               ctx->xsize, ctx->ysize);
+
+    if (verify_effective && bf_preunwrap)
+        memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
+
+    out->num_pieces = UnwrapAroundCutsFrontier(
+        ctx->phase, ctx->bitflags, ctx->soln, ctx->xsize, ctx->ysize,
+        ctx->path_order, ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
+
     t2 = clock();
-    out->elapsed_ms   = timediff(t1, t2);
+    out->elapsed_ms = timediff(t1, t2);
 }
 
 static const unwrap_kernel_run_fn g_unwrap_kernel_runners[UNWRAP_BACKEND_COUNT] = {
     run_unwrap_kernel_parallel_cpu,
     run_unwrap_kernel_serial_cpu,
-    run_unwrap_kernel_cuda_stub,
+    run_unwrap_kernel_cuda,
 };
 
 static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
     "parallel_cpu",
     "serial_cpu",
-    "cuda_stub",
+    "cuda",
 };
 
 /* -----------------------------------------------------------------------
@@ -1355,7 +1378,8 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
  *
  *  unwrap_backend – UNWRAP_BACKEND_PARALLEL_CPU (default OpenMP path),
  *                   UNWRAP_BACKEND_SERIAL_CPU (serial reference), or
- *                   UNWRAP_BACKEND_CUDA_STUB (placeholder, clears soln).
+ *                   UNWRAP_BACKEND_CUDA_STUB (CPU residues / cuts / unwrap; CUDA
+ *                   residue-matching kernel only when device buffers exist).
  *
  *  Return value  – elapsed ms for the selected unwrap kernel (residue detect +
  *                  branch cuts + frontier unwrap).  Disk I/O, RMS, and extra
@@ -1489,11 +1513,12 @@ double goldstein_phase_unwrapping(const char *input_path,
         }
     }
 
-    /* ---- Timed: pluggable unwrap kernel ---- */
+    /* ---- Pluggable unwrap kernel (CUDA device malloc not timed below) ---- */
     {
         UnwrapKernelCtx     kctx;
         UnwrapKernelResult kres;
 
+        memset(&kctx, 0, sizeof(kctx));
         kctx.phase       = phase;
         kctx.bitflags    = bitflags;
         kctx.soln        = soln;
@@ -1505,11 +1530,28 @@ double goldstein_phase_unwrapping(const char *input_path,
         kctx.gradx       = gradx;
         kctx.list        = list;
 
+        if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB) {
+            int cuda_alloc_rc;
+            if (unwrap_cuda_init() != 0)
+                fprintf(stderr,
+                        "unwrap backend 'cuda': init failed (device buffers "
+                        "not allocated).\n");
+            else if ((cuda_alloc_rc = unwrap_cuda_device_bufs_alloc(length, &kctx.cuda_dev))
+                     != 0)
+                fprintf(stderr,
+                        "unwrap backend 'cuda': cudaMalloc failed (cuda error %d)\n",
+                        cuda_alloc_rc);
+        }
+
+        /* ---- Timed: pluggable unwrap kernel ---- */
         g_unwrap_kernel_runners[unwrap_backend](
             &kctx, verify_effective, snap_after_res, bf_preunwrap, &kres);
-        NumRes      = kres.num_residues;
-        num_pieces  = kres.num_pieces;
+        NumRes       = kres.num_residues;
+        num_pieces   = kres.num_pieces;
         elapsed_time = kres.elapsed_ms;
+
+        if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
+            unwrap_cuda_device_bufs_free(&kctx.cuda_dev);
     }
 
     printf("Number of residues: %d\n", NumRes);
@@ -1669,7 +1711,7 @@ static void print_usage(const char *prog)
         "  -v, --verify-serial    Compare parallel vs serial; extra work/memory;\n"
         "                         writes residues/branchcuts debug TIFFs\n"
         "  -B, --backend <name>   Unwrap kernel: parallel_cpu (default), serial_cpu,\n"
-        "                         or cuda_stub (CUDA placeholder; clears soln)\n"
+        "                         or cuda_stub (CPU pipeline + CUDA matching hook)\n"
         "  -h, --help             Show this help message\n"
         "\n"
         "Examples:\n"
