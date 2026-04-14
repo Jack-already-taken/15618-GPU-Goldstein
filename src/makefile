@@ -1,30 +1,27 @@
-# Host: gcc/g++ (OpenMP via -fopenmp / libgomp).
-# CUDA: nvc++ (NVHPC); nvcc is not required.
-#
-# After `module load nvhpc`, nvc++ is on PATH. CUDA toolkit layout is typically:
-#   .../Linux_x86_64/<ver>/compilers/bin/nvc++
-#   .../Linux_x86_64/<ver>/cuda/{include,lib64}
-# If the module sets CUDA_HOME, that value is kept (see ?= below).
+# Host: gcc/g++ (OpenMP via -fopenmp / libgomp)
+# CUDA: nvcc
 
 IDIR = ../include
+ODIR = obj
+
 CC   = gcc
 CXX  = g++
+NVCC := $(shell command -v nvcc 2>/dev/null)
 
-NVCXX := $(shell command -v nvc++ 2>/dev/null)
-ifeq ($(strip $(NVCXX)),)
-$(error nvc++ not found. Load NVHPC first, e.g.: module load nvhpc)
+ifeq ($(strip $(NVCC)),)
+$(error nvcc not found. Load CUDA first or add nvcc to PATH)
 endif
 
-# Prefer module-provided CUDA_HOME; else infer from nvc++ install tree.
-CUDA_HOME ?= $(abspath $(dir $(NVCXX))/../../cuda)
+# Prefer environment CUDA_HOME if already set; otherwise infer from nvcc
+CUDA_HOME ?= $(abspath $(dir $(NVCC))/..)
 
-CFLAGS = -I$(IDIR) -std=gnu11 -O3 -Wall
-CXXFLAGS = -I$(IDIR) -std=c++17 -O3 -Wall -Dcimg_display=0 -Dcimg_use_tiff
+CFLAGS   = -I$(IDIR) -std=gnu11 -O3 -Wall -fno-pie
+CXXFLAGS = -I$(IDIR) -std=c++17 -O3 -Wall -fno-pie -Dcimg_display=0 -Dcimg_use_tiff
+LDFLAGS  = -fopenmp -no-pie
+LDLIBS   = -lm -ltiff -lstdc++ -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart
 
-# nvc++ builds CUDA C++ translation units; -cuda enables CUDA compilation/linking.
-NVCXX_CUDA_FLAGS = -cuda -O3 -std=c++17 -Wall -I$(IDIR) -I$(CUDA_HOME)/include
-
-ODIR = obj
+# nvcc flags for CUDA compilation
+NVCCFLAGS = -O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/g++-11 -I$(IDIR) -I$(CUDA_HOME)/include 
 
 .DEFAULT_GOAL := main
 
@@ -34,22 +31,20 @@ DEPS  = $(patsubst %,$(IDIR)/%,$(_DEPS))
 _OBJ = main.o util.o extract.o grad.o tiff_io.o unwrap_cuda.o
 OBJ  = $(patsubst %,$(ODIR)/%,$(_OBJ))
 
-
-$(ODIR)/%.o: %.c $(DEPS) | $(ODIR)
-	$(CC) -fopenmp -c -o $@ $< $(CFLAGS)
-
-$(ODIR)/tiff_io.o: tiff_io.cpp $(IDIR)/tiff_io.h $(IDIR)/CImg.h | $(ODIR)
-	$(CXX) -fopenmp -c -o $@ $< $(CXXFLAGS)
-
-$(ODIR)/unwrap_cuda.o: unwrap_cuda.cu $(IDIR)/unwrap_cuda.h | $(ODIR)
-	$(NVCXX) $(NVCXX_CUDA_FLAGS) -c -o $@ $<
-
-main: $(OBJ)
-	$(CC) -fopenmp -o $@ $^ $(CFLAGS) -lm -ltiff -lstdc++ \
-		-L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart
-
 $(ODIR):
 	mkdir -p $(ODIR)
+
+$(ODIR)/%.o: %.c $(DEPS) | $(ODIR)
+	$(CC) -fopenmp $(CFLAGS) -c -o $@ $<
+
+$(ODIR)/tiff_io.o: tiff_io.cpp $(IDIR)/tiff_io.h $(IDIR)/CImg.h | $(ODIR)
+	$(CXX) -fopenmp $(CXXFLAGS) -c -o $@ $<
+
+$(ODIR)/unwrap_cuda.o: unwrap_cuda.cu $(IDIR)/unwrap_cuda.h | $(ODIR)
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+main: $(OBJ)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 .PHONY: clean
 
