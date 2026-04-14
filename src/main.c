@@ -1226,6 +1226,10 @@ typedef struct UnwrapKernelResult {
     int     num_residues;
     int     num_pieces;
     double  elapsed_ms;
+    double  ms_residues;
+    double  ms_branch_cuts;
+    double  ms_unwrap;
+    double  ms_cuda_residue_match;
 } UnwrapKernelResult;
 
 typedef void (*unwrap_kernel_run_fn)(UnwrapKernelCtx *ctx,
@@ -1241,24 +1245,36 @@ static void run_unwrap_kernel_parallel_cpu(
     unsigned char *bf_preunwrap,
     UnwrapKernelResult *out)
 {
-    clock_t t1, t2;
+    clock_t ta, tb;
     int MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
-    t1 = clock();
+    out->ms_cuda_residue_match = 0.0;
+
+    ta = clock();
     out->num_residues = Residues_parallel(ctx->phase, ctx->bitflags,
                                           ctx->xsize, ctx->ysize);
+    tb = clock();
+    out->ms_residues = timediff(ta, tb);
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
+
+    ta = clock();
     GoldsteinBranchCuts_parallel(ctx->bitflags, MaxCutLen,
                                  out->num_residues, ctx->xsize, ctx->ysize);
+    tb = clock();
+    out->ms_branch_cuts = timediff(ta, tb);
     if (verify_effective && bf_preunwrap)
         memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
+
+    ta = clock();
     out->num_pieces = UnwrapAroundCutsFrontier(
         ctx->phase, ctx->bitflags, ctx->soln,
         ctx->xsize, ctx->ysize, ctx->path_order,
         ctx->grady, ctx->gradx, ctx->list, ctx->length, 1);
-    t2 = clock();
-    out->elapsed_ms = timediff(t1, t2);
+    tb = clock();
+    out->ms_unwrap = timediff(ta, tb);
+
+    out->elapsed_ms = out->ms_residues + out->ms_branch_cuts + out->ms_unwrap;
 }
 
 static void run_unwrap_kernel_serial_cpu(
@@ -1268,24 +1284,36 @@ static void run_unwrap_kernel_serial_cpu(
     unsigned char *bf_preunwrap,
     UnwrapKernelResult *out)
 {
-    clock_t t1, t2;
+    clock_t ta, tb;
     int MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
-    (void)verify_effective;
-    (void)snap_after_res;
-    (void)bf_preunwrap;
+    out->ms_cuda_residue_match = 0.0;
 
-    t1 = clock();
+    ta = clock();
     out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
                                         ctx->xsize, ctx->ysize);
+    tb = clock();
+    out->ms_residues = timediff(ta, tb);
+    if (verify_effective && snap_after_res)
+        memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
+
+    ta = clock();
     GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
                                out->num_residues, ctx->xsize, ctx->ysize);
+    tb = clock();
+    out->ms_branch_cuts = timediff(ta, tb);
+    if (verify_effective && bf_preunwrap)
+        memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
+
+    ta = clock();
     out->num_pieces = UnwrapAroundCutsFrontier(
         ctx->phase, ctx->bitflags, ctx->soln,
         ctx->xsize, ctx->ysize, ctx->path_order,
         ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
-    t2 = clock();
-    out->elapsed_ms = timediff(t1, t2);
+    tb = clock();
+    out->ms_unwrap = timediff(ta, tb);
+
+    out->elapsed_ms = out->ms_residues + out->ms_branch_cuts + out->ms_unwrap;
 }
 
 static void run_unwrap_kernel_cuda(
@@ -1295,40 +1323,51 @@ static void run_unwrap_kernel_cuda(
     unsigned char *bf_preunwrap,
     UnwrapKernelResult *out)
 {
-    clock_t t1, t2;
+    clock_t ta, tb;
     int      MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
-    t1 = clock();
-
     /* Residues: CPU (serial), same as serial_cpu backend. */
+    ta = clock();
     out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
                                         ctx->xsize, ctx->ysize);
+    tb = clock();
+    out->ms_residues = timediff(ta, tb);
 
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
 
     /* Residue matching: CUDA only (uses d_bitflags); skipped if alloc failed. */
-    if (ctx->cuda_dev.d_bitflags)
+    if (ctx->cuda_dev.d_bitflags) {
+        ta = clock();
         unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
                                             out->num_residues, ctx->xsize, ctx->ysize,
                                             ctx->length);
-    else
+        tb = clock();
+        out->ms_branch_cuts = timediff(ta, tb);
+    } else {
+        out->ms_branch_cuts = 0.0;
         fprintf(stderr,
                 "unwrap backend 'cuda': no d_bitflags; skipping CUDA residue-matching "
                 "kernel.\n");
-
-    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
-                               ctx->xsize, ctx->ysize);
+        ta = clock();
+        GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
+                                ctx->xsize, ctx->ysize);
+        tb = clock();
+        out->ms_branch_cuts = timediff(ta, tb);
+    }
 
     if (verify_effective && bf_preunwrap)
         memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
 
+    ta = clock();
     out->num_pieces = UnwrapAroundCutsFrontier(
         ctx->phase, ctx->bitflags, ctx->soln, ctx->xsize, ctx->ysize,
         ctx->path_order, ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
+    tb = clock();
+    out->ms_unwrap = timediff(ta, tb);
 
-    t2 = clock();
-    out->elapsed_ms = timediff(t1, t2);
+    out->elapsed_ms = out->ms_residues + out->ms_cuda_residue_match
+        + out->ms_branch_cuts + out->ms_unwrap;
 }
 
 static const unwrap_kernel_run_fn g_unwrap_kernel_runners[UNWRAP_BACKEND_COUNT] = {
@@ -1354,8 +1393,7 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
  *
  *  output_prefix – path prefix used for output files (no extension).
  *                  Always writes *_unwrapped.tif (float32 radians).
- *                  With verify_serial on parallel_cpu: *_residues.tif and
- *                  *_branchcuts.tif (debug).
+ *                  With verify_serial: *_residues.tif and *_branchcuts.tif (debug).
  *
  *  type          – binary-format selector passed to GetPhase (ignored for
  *                  image inputs):
@@ -1371,19 +1409,20 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
  *  gt_lo, gt_hi  – optional metadata from JSON (for logging only; RMS uses
  *                  samples read directly from the TIFF).
  *  gt_json_valid – 1 if true_lo/true_hi were read from JSON successfully.
- *  verify_serial  – if non-zero, compare parallel pipeline vs serial references
- *                   at residues, branch cuts (serial vs 1-thread parallel),
- *                   and unwrap (OMP vs serial AVOID-band pass).  Only honored
- *                   when unwrap_backend == UNWRAP_BACKEND_PARALLEL_CPU.
+ *  verify_serial  – if non-zero, run serial-reference checks for the selected
+ *                   backend: residue flags vs Residues_serial; branch layout
+ *                   vs GoldsteinBranchCuts_serial and vs parallel@1 thread from
+ *                   the same post-residue snapshot; unwrap vs a serial AVOID-band
+ *                   replay from the same pre-unwrap bitflags.
  *
  *  unwrap_backend – UNWRAP_BACKEND_PARALLEL_CPU (default OpenMP path),
  *                   UNWRAP_BACKEND_SERIAL_CPU (serial reference), or
  *                   UNWRAP_BACKEND_CUDA_STUB (CPU residues / cuts / unwrap; CUDA
  *                   residue-matching kernel only when device buffers exist).
  *
- *  Return value  – elapsed ms for the selected unwrap kernel (residue detect +
- *                  branch cuts + frontier unwrap).  Disk I/O, RMS, and extra
- *                  verify work are timed separately (outside).
+ *  Return value  – elapsed ms for the selected unwrap kernel (sum of residue,
+ *                  optional CUDA match, branch cuts, and frontier unwrap).
+ *                  A timing report also prints host I/O, prep, verify, and output.
  * -------------------------------------------------------------------- */
 double goldstein_phase_unwrapping(const char *input_path,
                                    const char *output_prefix,
@@ -1405,6 +1444,12 @@ double goldstein_phase_unwrapping(const char *input_path,
     float         *mask;
     unsigned char *unwrap, *bitflags;
     double         elapsed_time;
+    double         ms_load_phase = 0.0, ms_load_mask = 0.0, ms_bitflags_init = 0.0;
+    double         ms_gradxy = 0.0, ms_cuda_setup = 0.0, ms_verify = 0.0;
+    double         ms_write_tiff = 0.0, ms_gt_rms = 0.0;
+    double         ms_k_residues = 0.0, ms_k_branch = 0.0, ms_k_unwrap = 0.0;
+    double         ms_k_cuda_match = 0.0;
+    clock_t        _t0, _t1;
     FILE          *ifp, *ifm;
     char           fname[PATH_MAX];
     int            k, length, num_pieces, NumRes, MaxCutLen;
@@ -1427,17 +1472,15 @@ double goldstein_phase_unwrapping(const char *input_path,
         unwrap_backend = UNWRAP_BACKEND_PARALLEL_CPU;
     }
 
-    verify_effective = verify_serial
-        && (unwrap_backend == UNWRAP_BACKEND_PARALLEL_CPU);
-    if (verify_serial && !verify_effective)
-        fprintf(stderr,
-                "Note: --verify-serial applies only to the parallel_cpu "
-                "backend.\n");
+    verify_effective = verify_serial;
 
     /* ---- For TIFF inputs load now to discover dimensions ---- */
     float *img_phase = NULL;
     if (is_tiff) {
+        _t0 = clock();
         img_phase = load_phase_from_tiff(input_path, &xsize, &ysize);
+        _t1 = clock();
+        ms_load_phase = timediff(_t0, _t1);
     }
 
     /* ---- Allocate working arrays ---- */
@@ -1455,11 +1498,14 @@ double goldstein_phase_unwrapping(const char *input_path,
 
     /* ---- Read mask ---- */
     if (mask_flag) {
+        _t0 = clock();
         snprintf(fname, sizeof(fname), "%s.mask", output_prefix);
         OpenFile(&ifm, fname, "rb");
         GetPhase(type, ifm, fname, mask, xsize, ysize);
         for (k = 0; k < length; k++)
             mask[k] = (mask[k] > 0) ? 1.0f : 0.0f;
+        _t1 = clock();
+        ms_load_mask = timediff(_t0, _t1);
     } else {
         for (k = 0; k < length; k++)
             mask[k] = 1.0f;
@@ -1473,21 +1519,30 @@ double goldstein_phase_unwrapping(const char *input_path,
         img_phase = NULL;
     } else {
         /* Binary file: delegate to the existing reader */
+        _t0 = clock();
         strncpy(fname, input_path, sizeof(fname) - 1);
         fname[sizeof(fname) - 1] = '\0';
         OpenFile(&ifp, fname, "rb");
         GetPhase(type, ifp, fname, phase, xsize, ysize);
+        _t1 = clock();
+        ms_load_phase = timediff(_t0, _t1);
     }
 
     /* ---- Initialise bitflags from mask ---- */
+    _t0 = clock();
     #pragma omp parallel for default(none) \
     private(k) \
     shared(length, mask, bitflags)
     for (k = 0; k < length; k++)
         bitflags[k] = (mask[k] == 0.0f) ? BORDER : 0;
+    _t1 = clock();
+    ms_bitflags_init = timediff(_t0, _t1);
 
     /* ---- Pre-compute x/y gradients ---- */
+    _t0 = clock();
     Gradxy(phase, gradx, grady, xsize, ysize);
+    _t1 = clock();
+    ms_gradxy = timediff(_t0, _t1);
 
     MaxCutLen = (xsize + ysize) / 2;
 
@@ -1532,6 +1587,7 @@ double goldstein_phase_unwrapping(const char *input_path,
 
         if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB) {
             int cuda_alloc_rc;
+            _t0 = clock();
             if (unwrap_cuda_init() != 0)
                 fprintf(stderr,
                         "unwrap backend 'cuda': init failed (device buffers "
@@ -1541,14 +1597,21 @@ double goldstein_phase_unwrapping(const char *input_path,
                 fprintf(stderr,
                         "unwrap backend 'cuda': cudaMalloc failed (cuda error %d)\n",
                         cuda_alloc_rc);
+            _t1 = clock();
+            ms_cuda_setup = timediff(_t0, _t1);
         }
 
         /* ---- Timed: pluggable unwrap kernel ---- */
+        memset(&kres, 0, sizeof(kres));
         g_unwrap_kernel_runners[unwrap_backend](
             &kctx, verify_effective, snap_after_res, bf_preunwrap, &kres);
         NumRes       = kres.num_residues;
         num_pieces   = kres.num_pieces;
         elapsed_time = kres.elapsed_ms;
+        ms_k_residues   = kres.ms_residues;
+        ms_k_branch     = kres.ms_branch_cuts;
+        ms_k_unwrap     = kres.ms_unwrap;
+        ms_k_cuda_match = kres.ms_cuda_residue_match;
 
         if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
             unwrap_cuda_device_bufs_free(&kctx.cuda_dev);
@@ -1557,6 +1620,7 @@ double goldstein_phase_unwrapping(const char *input_path,
     printf("Number of residues: %d\n", NumRes);
 
     if (verify_effective) {
+        _t0 = clock();
         bf_res_ser = (unsigned char *)malloc((size_t)length);
         if (bf_res_ser && snap_after_res) {
             for (k = 0; k < length; k++)
@@ -1600,18 +1664,22 @@ double goldstein_phase_unwrapping(const char *input_path,
                                      grady, gradx, list, length, 0);
             soln_diff_stats(soln, soln_ser, length, &soln_max_abs, &n_soln_bad, 1e-5f);
 
-            printf("\n=== Parallel vs serial correctness ===\n");
+            printf("\n=== Correctness (--verify-serial; backend=%s) ===\n",
+                   g_unwrap_backend_names[unwrap_backend]);
             printf("  Residues (POS|NEG) : %s  (%d mismatched cells)\n",
                    mis_res ? "CHECK" : "PASS", mis_res);
             printf("  Branch layout      : %s  (%d mismatched cells; "
                    "GoldsteinBranchCuts_serial vs parallel@1 thread)\n",
                    mis_brc ? "CHECK" : "PASS", mis_brc);
-            printf("  Unwrap (main vs serial AVOID pass) : %s  "
+            printf("  Unwrap (kernel vs serial AVOID replay) : %s  "
                    "(max |Δ| = %.6g, cells > 1e-5: %d)\n",
                    n_soln_bad ? "CHECK" : "PASS", soln_max_abs, n_soln_bad);
         }
+        _t1 = clock();
+        ms_verify = timediff(_t0, _t1);
     }
 
+    _t0 = clock();
     if (verify_effective && snap_after_res) {
         snprintf(fname, sizeof(fname), "%s_residues.tif", output_prefix);
         save_byte_as_tiff(fname, snap_after_res, xsize, ysize, RESIDUE);
@@ -1629,15 +1697,16 @@ double goldstein_phase_unwrapping(const char *input_path,
     free(path_order_ser);
 
     printf("Number of pieces: %d\n", num_pieces);
-    printf("Elapsed time (%s kernel): %f ms\n",
-           g_unwrap_backend_names[unwrap_backend], elapsed_time);
 
     /* ---- Save unwrapped phase (float32 radians) ---- */
     snprintf(fname, sizeof(fname), "%s_unwrapped.tif", output_prefix);
     save_float_as_tiff(fname, soln, xsize, ysize);
+    _t1 = clock();
+    ms_write_tiff = timediff(_t0, _t1);
 
     /* ---- RMS test against ground truth (float32 radians TIFF) ---- */
     if (gt_path) {
+        _t0 = clock();
         float *truth = load_ground_truth_tiff(gt_path, xsize, ysize);
         if (truth) {
             double rms = compute_rms(soln, truth, length);
@@ -1657,8 +1726,29 @@ double goldstein_phase_unwrapping(const char *input_path,
                    "(same as prior uint8-PNG pipeline, without 8-bit decode)\n");
             free(truth);
         }
+        _t1 = clock();
+        ms_gt_rms = timediff(_t0, _t1);
     }
 
+    printf("\n=== Timing report (ms, clock()) ===\n");
+    printf("  %-28s %12.3f\n", "Load wrapped phase", ms_load_phase);
+    if (mask_flag)
+        printf("  %-28s %12.3f\n", "Load mask", ms_load_mask);
+    printf("  %-28s %12.3f\n", "Init bitflags (from mask)", ms_bitflags_init);
+    printf("  %-28s %12.3f\n", "Gradxy", ms_gradxy);
+    if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
+        printf("  %-28s %12.3f\n", "CUDA init + device malloc", ms_cuda_setup);
+    printf("  --- unwrap kernel (%s) ---\n",
+           g_unwrap_backend_names[unwrap_backend]);
+    printf("  %-28s %12.3f\n", "  Residues", ms_k_residues);
+    printf("  %-28s %12.3f\n", "  Branch cuts", ms_k_branch);
+    printf("  %-28s %12.3f\n", "  Unwrap (frontier)", ms_k_unwrap);
+    printf("  %-28s %12.3f\n", "  Kernel subtotal", elapsed_time);
+    if (verify_effective)
+        printf("  %-28s %12.3f\n", "verify_serial (CPU checks)", ms_verify);
+    printf("  %-28s %12.3f\n", "Write output TIFF(s)", ms_write_tiff);
+    if (gt_path)
+        printf("  %-28s %12.3f\n", "Ground truth load + RMS", ms_gt_rms);
     printf("\n");
 
     /* ---- Deallocate ---- */
@@ -1708,8 +1798,8 @@ static void print_usage(const char *prog)
         "                         Default: input directory; stem from basename.\n"
         "  -m, --mask             Enable mask loading (<prefix>.mask)\n"
         "  -t, --threads <n>      Number of OpenMP threads\n"
-        "  -v, --verify-serial    Compare parallel vs serial; extra work/memory;\n"
-        "                         writes residues/branchcuts debug TIFFs\n"
+        "  -v, --verify-serial    Serial cross-checks for any -B backend;\n"
+        "                         extra work/memory; debug residue/branch TIFFs\n"
         "  -B, --backend <name>   Unwrap kernel: parallel_cpu (default), serial_cpu,\n"
         "                         or cuda_stub (CPU pipeline + CUDA matching hook)\n"
         "  -h, --help             Show this help message\n"
