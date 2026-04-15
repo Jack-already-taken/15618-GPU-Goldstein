@@ -118,6 +118,8 @@ extern "C" void unwrap_cuda_device_bufs_free(UnwrapCudaDeviceBufs *buf)
     memset(buf, 0, sizeof(*buf));
 }
 
+
+
 extern "C" int unwrap_cuda_launch_residue_identification(
     float *h_phase, unsigned char *h_bitflags, const UnwrapCudaDeviceBufs *dev, int xsize, int ysize,
     int length)
@@ -141,8 +143,26 @@ extern "C" int unwrap_cuda_launch_residue_identification(
 
     dim3 block(16, 16);
     dim3 grid = residue_grid(xsize, ysize);
+
+    /* --- CUDA event timing --- */
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
     k_identify_residues<<<grid, block>>>(dev->d_phase, dev->d_bitflags, xsize, ysize,
                                          dev->d_residue_count);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float kernel_ms = 0;
+    cudaEventElapsedTime(&kernel_ms, start, stop);
+    printf("  [GPU] residue kernel only: %.4f ms\n", kernel_ms);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    /* --- end timing --- */
+
     if ((e = cudaGetLastError()) != cudaSuccess)
         return cuda_fail(e, "k_identify_residues");
     if ((e = cudaDeviceSynchronize()) != cudaSuccess)

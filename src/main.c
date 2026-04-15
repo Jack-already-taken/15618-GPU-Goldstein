@@ -1247,6 +1247,10 @@ static void run_unwrap_kernel_parallel_cpu(
     t1 = clock();
     out->num_residues = Residues_parallel(ctx->phase, ctx->bitflags,
                                           ctx->xsize, ctx->ysize);
+
+    printf("  [DEBUG] d_phase=%p d_bitflags=%p\n",
+       (void*)ctx->cuda_dev.d_phase,
+       (void*)ctx->cuda_dev.d_bitflags);
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
     GoldsteinBranchCuts_parallel(ctx->bitflags, MaxCutLen,
@@ -1278,13 +1282,15 @@ static void run_unwrap_kernel_serial_cpu(
     t1 = clock();
     out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
                                         ctx->xsize, ctx->ysize);
+    t2 = clock();
+    printf("  [CPU] residue only: %.4f ms\n", timediff(t1, t2));
     GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
                                out->num_residues, ctx->xsize, ctx->ysize);
     out->num_pieces = UnwrapAroundCutsFrontier(
         ctx->phase, ctx->bitflags, ctx->soln,
         ctx->xsize, ctx->ysize, ctx->path_order,
         ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
-    t2 = clock();
+    
     out->elapsed_ms = timediff(t1, t2);
 }
 
@@ -1298,24 +1304,48 @@ static void run_unwrap_kernel_cuda(
     clock_t t1, t2;
     int      MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
+    // t1 = clock();
+
+    // /* Residues: CPU (serial), same as serial_cpu backend. */
+    // out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+    //                                     ctx->xsize, ctx->ysize);
+
+    // if (verify_effective && snap_after_res)
+    //     memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
+
+    // /* Residue matching: CUDA only (uses d_bitflags); skipped if alloc failed. */
+    // if (ctx->cuda_dev.d_bitflags)
+    //     unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
+    //                                         out->num_residues, ctx->xsize, ctx->ysize,
+    //                                         ctx->length);
+    // else
+    //     fprintf(stderr,
+    //             "unwrap backend 'cuda': no d_bitflags; skipping CUDA residue-matching "
+    //             "kernel.\n");
+
     t1 = clock();
 
-    /* Residues: CPU (serial), same as serial_cpu backend. */
-    out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
-                                        ctx->xsize, ctx->ysize);
+    printf("  [DEBUG] d_phase=%p d_bitflags=%p\n",
+       (void*)ctx->cuda_dev.d_phase,
+       (void*)ctx->cuda_dev.d_bitflags);
+
+    /* Residues: GPU naive global-memory kernel */
+    if (ctx->cuda_dev.d_phase && ctx->cuda_dev.d_bitflags) {
+        out->num_residues = unwrap_cuda_launch_residue_identification(
+            ctx->phase,
+            ctx->bitflags,
+            &ctx->cuda_dev,
+            ctx->xsize,
+            ctx->ysize,
+            ctx->length);
+    } else {
+        fprintf(stderr, "unwrap backend 'cuda': device bufs missing, falling back to CPU residues.\n");
+        out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+                                            ctx->xsize, ctx->ysize);
+    }
 
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
-
-    /* Residue matching: CUDA only (uses d_bitflags); skipped if alloc failed. */
-    if (ctx->cuda_dev.d_bitflags)
-        unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
-                                            out->num_residues, ctx->xsize, ctx->ysize,
-                                            ctx->length);
-    else
-        fprintf(stderr,
-                "unwrap backend 'cuda': no d_bitflags; skipping CUDA residue-matching "
-                "kernel.\n");
 
     GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
                                ctx->xsize, ctx->ysize);
@@ -1428,7 +1458,8 @@ double goldstein_phase_unwrapping(const char *input_path,
     }
 
     verify_effective = verify_serial
-        && (unwrap_backend == UNWRAP_BACKEND_PARALLEL_CPU);
+    && (unwrap_backend == UNWRAP_BACKEND_PARALLEL_CPU
+        || unwrap_backend == UNWRAP_BACKEND_CUDA_STUB);
     if (verify_serial && !verify_effective)
         fprintf(stderr,
                 "Note: --verify-serial applies only to the parallel_cpu "
