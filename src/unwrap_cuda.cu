@@ -154,7 +154,7 @@ __device__ __forceinline__ void stamp_branch_cut(unsigned char *bitflags,
 }
 
 
-__device__ __forceinline__ bool is_blocked_flag(unsigned char b)
+__host__ __device__ __forceinline__ bool is_blocked_flag(unsigned char b)
 {
     return (b & (kBranchCut | kBorder)) != 0;
 }
