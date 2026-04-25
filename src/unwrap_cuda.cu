@@ -397,7 +397,16 @@ __global__ void k_fill_avoid_band(float *__restrict__ soln,
         soln[k] = soln[nidx] + device_gradient(phase[k], phase[nidx]);
 }
 
-__device__ __forceinline__ void seed_from_left_neighbor(
+/* Paper-faithful boundary seeding: every boundary pixel of the tile inspects
+ * each neighbor that lies OUTSIDE the tile and seeds itself from the first
+ * one that is non-blocked and finite. All four sides are checked, regardless
+ * of seed_mode -- this matches the paper's "scan for first visited anchor"
+ * rule and is robust to tiles that have several solved neighbors at once
+ * (e.g., during ring-expansion at corners) or have one neighbor side blocked
+ * by a cut.
+ *
+ * Interior pixels are no-ops (none of the boundary conditions hit). */
+__device__ __forceinline__ void seed_from_outside_neighbors(
     float s_phase[][UNWRAP_TILE_W],
     unsigned char s_flags[][UNWRAP_TILE_W],
     float s_soln[][UNWRAP_TILE_W],
@@ -407,13 +416,36 @@ __device__ __forceinline__ void seed_from_left_neighbor(
     int tx, int ty, int gx, int gy, int xsize, int ysize,
     int *s_has_seed, int *s_progress, int *s_reached)
 {
-    if (tx != 0 || gx <= 0 || gy >= ysize)
+    if (gx >= xsize || gy >= ysize)
         return;
     if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
         return;
 
-    const int nidx = gy * xsize + (gx - 1);
-    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
+    /* Probe the four out-of-tile neighbors. First one that is non-blocked
+     * and has a finite global solution wins; we copy its unwrapped value
+     * adjusted by one wrap-difference step. */
+    int nidx = -1;
+    if (tx == 0 && gx > 0) {
+        const int n = gy * xsize + (gx - 1);
+        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
+            nidx = n;
+    }
+    if (nidx < 0 && tx == UNWRAP_TILE_W - 1 && gx + 1 < xsize) {
+        const int n = gy * xsize + (gx + 1);
+        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
+            nidx = n;
+    }
+    if (nidx < 0 && ty == 0 && gy > 0) {
+        const int n = (gy - 1) * xsize + gx;
+        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
+            nidx = n;
+    }
+    if (nidx < 0 && ty == UNWRAP_TILE_H - 1 && gy + 1 < ysize) {
+        const int n = (gy + 1) * xsize + gx;
+        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
+            nidx = n;
+    }
+    if (nidx < 0)
         return;
 
     s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
@@ -422,180 +454,153 @@ __device__ __forceinline__ void seed_from_left_neighbor(
     atomicExch(s_reached, 1);
 }
 
-__device__ __forceinline__ void seed_from_right_neighbor(
-    float s_phase[][UNWRAP_TILE_W],
-    unsigned char s_flags[][UNWRAP_TILE_W],
-    float s_soln[][UNWRAP_TILE_W],
-    const float *__restrict__ phase,
-    const unsigned char *__restrict__ bitflags,
-    const float *__restrict__ solved,
-    int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed, int *s_progress, int *s_reached)
-{
-    if (tx != UNWRAP_TILE_W - 1 || gx + 1 >= xsize || gy >= ysize)
-        return;
-    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
-        return;
-
-    const int nidx = gy * xsize + (gx + 1);
-    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
-        return;
-
-    s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
-    atomicExch(s_has_seed, 1);
-    atomicExch(s_progress, 1);
-    atomicExch(s_reached, 1);
-}
-
-__device__ __forceinline__ void seed_from_top_neighbor(
-    float s_phase[][UNWRAP_TILE_W],
-    unsigned char s_flags[][UNWRAP_TILE_W],
-    float s_soln[][UNWRAP_TILE_W],
-    const float *__restrict__ phase,
-    const unsigned char *__restrict__ bitflags,
-    const float *__restrict__ solved,
-    int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed, int *s_progress, int *s_reached)
-{
-    if (ty != 0 || gy <= 0 || gx >= xsize)
-        return;
-    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
-        return;
-
-    const int nidx = (gy - 1) * xsize + gx;
-    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
-        return;
-
-    s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
-    atomicExch(s_has_seed, 1);
-    atomicExch(s_progress, 1);
-    atomicExch(s_reached, 1);
-}
-
-__device__ __forceinline__ void seed_from_bottom_neighbor(
-    float s_phase[][UNWRAP_TILE_W],
-    unsigned char s_flags[][UNWRAP_TILE_W],
-    float s_soln[][UNWRAP_TILE_W],
-    const float *__restrict__ phase,
-    const unsigned char *__restrict__ bitflags,
-    const float *__restrict__ solved,
-    int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed, int *s_progress, int *s_reached)
-{
-    if (ty != UNWRAP_TILE_H - 1 || gy + 1 >= ysize || gx >= xsize)
-        return;
-    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
-        return;
-
-    const int nidx = (gy + 1) * xsize + gx;
-    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
-        return;
-
-    s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
-    atomicExch(s_has_seed, 1);
-    atomicExch(s_progress, 1);
-    atomicExch(s_reached, 1);
-}
-
+/* Paper-faithful directional sweeps (Algorithm 5 in the paper).
+ *
+ * Each sweep walks SERIALLY along one axis. Parallelism comes from running
+ * many independent rows (or columns) concurrently, NOT from a wavefront
+ * within a single row.  Concretely:
+ *
+ *   - Row sweeps (left/right): one thread per row does the full walk;
+ *     we use the threads with tx == 0 and ty in 0..H-1.
+ *   - Column sweeps (up/down): one thread per column; ty == 0 and tx in 0..W-1.
+ *
+ * Each walking thread maintains a running anchor: the last finite, non-cut
+ * pixel it saw. NaN pixels with a live anchor get unwrapped; cuts kill the
+ * anchor (segments past a cut need their own anchor, picked up from the
+ * boundary seeding or from a perpendicular sweep that ran earlier).
+ *
+ * Caller MUST place __syncthreads() between sweeps so the perpendicular
+ * sweep sees this sweep's writes to s_soln.
+ */
 __device__ inline void sweep_right(float s_phase[][UNWRAP_TILE_W],
                                    unsigned char s_flags[][UNWRAP_TILE_W],
                                    float s_soln[][UNWRAP_TILE_W],
-                                   int tx, int ty, int gx, int gy,
-                                   int xsize, int ysize,
-                                   int *s_cycle_changed,
-                                   int *s_progress,
-                                   int *s_reached)
+                                   int tx, int ty,
+                                   int *s_progress, int *s_reached)
 {
+    if (tx != 0) return;
+    bool have_anchor = false;
+    float prev_unwr = 0.0f;
+    float prev_wrap = 0.0f;
+    #pragma unroll
     for (int x = 0; x < UNWRAP_TILE_W; ++x) {
-        if (tx == x && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
-            if (tx > 0 && !is_blocked_flag(s_flags[ty][tx - 1])
-                && isfinite(s_soln[ty][tx - 1])) {
-                s_soln[ty][tx] = s_soln[ty][tx - 1]
-                               + device_gradient(s_phase[ty][tx], s_phase[ty][tx - 1]);
-                atomicExch(s_cycle_changed, 1);
-                atomicExch(s_progress, 1);
-                atomicExch(s_reached, 1);
-            }
+        if (is_blocked_flag(s_flags[ty][x])) {
+            have_anchor = false;
+            continue;
         }
-        __syncthreads();
+        if (isfinite(s_soln[ty][x])) {
+            prev_unwr = s_soln[ty][x];
+            prev_wrap = s_phase[ty][x];
+            have_anchor = true;
+            continue;
+        }
+        if (!have_anchor) continue;
+        const float wv = s_phase[ty][x];
+        const float uv = prev_unwr + device_gradient(wv, prev_wrap);
+        s_soln[ty][x] = uv;
+        prev_unwr = uv;
+        prev_wrap = wv;
+        atomicExch(s_progress, 1);
+        atomicExch(s_reached, 1);
     }
 }
 
 __device__ inline void sweep_left(float s_phase[][UNWRAP_TILE_W],
                                   unsigned char s_flags[][UNWRAP_TILE_W],
                                   float s_soln[][UNWRAP_TILE_W],
-                                  int tx, int ty, int gx, int gy,
-                                  int xsize, int ysize,
-                                  int *s_cycle_changed,
-                                  int *s_progress,
-                                  int *s_reached)
+                                  int tx, int ty,
+                                  int *s_progress, int *s_reached)
 {
+    if (tx != 0) return;
+    bool have_anchor = false;
+    float prev_unwr = 0.0f;
+    float prev_wrap = 0.0f;
+    #pragma unroll
     for (int x = UNWRAP_TILE_W - 1; x >= 0; --x) {
-        if (tx == x && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
-            if (tx + 1 < UNWRAP_TILE_W && gx + 1 < xsize
-                && !is_blocked_flag(s_flags[ty][tx + 1])
-                && isfinite(s_soln[ty][tx + 1])) {
-                s_soln[ty][tx] = s_soln[ty][tx + 1]
-                               + device_gradient(s_phase[ty][tx], s_phase[ty][tx + 1]);
-                atomicExch(s_cycle_changed, 1);
-                atomicExch(s_progress, 1);
-                atomicExch(s_reached, 1);
-            }
+        if (is_blocked_flag(s_flags[ty][x])) {
+            have_anchor = false;
+            continue;
         }
-        __syncthreads();
+        if (isfinite(s_soln[ty][x])) {
+            prev_unwr = s_soln[ty][x];
+            prev_wrap = s_phase[ty][x];
+            have_anchor = true;
+            continue;
+        }
+        if (!have_anchor) continue;
+        const float wv = s_phase[ty][x];
+        const float uv = prev_unwr + device_gradient(wv, prev_wrap);
+        s_soln[ty][x] = uv;
+        prev_unwr = uv;
+        prev_wrap = wv;
+        atomicExch(s_progress, 1);
+        atomicExch(s_reached, 1);
     }
 }
 
 __device__ inline void sweep_down(float s_phase[][UNWRAP_TILE_W],
                                   unsigned char s_flags[][UNWRAP_TILE_W],
                                   float s_soln[][UNWRAP_TILE_W],
-                                  int tx, int ty, int gx, int gy,
-                                  int xsize, int ysize,
-                                  int *s_cycle_changed,
-                                  int *s_progress,
-                                  int *s_reached)
+                                  int tx, int ty,
+                                  int *s_progress, int *s_reached)
 {
+    if (ty != 0) return;
+    bool have_anchor = false;
+    float prev_unwr = 0.0f;
+    float prev_wrap = 0.0f;
+    #pragma unroll
     for (int y = 0; y < UNWRAP_TILE_H; ++y) {
-        if (ty == y && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
-            if (ty > 0 && !is_blocked_flag(s_flags[ty - 1][tx])
-                && isfinite(s_soln[ty - 1][tx])) {
-                s_soln[ty][tx] = s_soln[ty - 1][tx]
-                               + device_gradient(s_phase[ty][tx], s_phase[ty - 1][tx]);
-                atomicExch(s_cycle_changed, 1);
-                atomicExch(s_progress, 1);
-                atomicExch(s_reached, 1);
-            }
+        if (is_blocked_flag(s_flags[y][tx])) {
+            have_anchor = false;
+            continue;
         }
-        __syncthreads();
+        if (isfinite(s_soln[y][tx])) {
+            prev_unwr = s_soln[y][tx];
+            prev_wrap = s_phase[y][tx];
+            have_anchor = true;
+            continue;
+        }
+        if (!have_anchor) continue;
+        const float wv = s_phase[y][tx];
+        const float uv = prev_unwr + device_gradient(wv, prev_wrap);
+        s_soln[y][tx] = uv;
+        prev_unwr = uv;
+        prev_wrap = wv;
+        atomicExch(s_progress, 1);
+        atomicExch(s_reached, 1);
     }
 }
 
 __device__ inline void sweep_up(float s_phase[][UNWRAP_TILE_W],
                                 unsigned char s_flags[][UNWRAP_TILE_W],
                                 float s_soln[][UNWRAP_TILE_W],
-                                int tx, int ty, int gx, int gy,
-                                int xsize, int ysize,
-                                int *s_cycle_changed,
-                                int *s_progress,
-                                int *s_reached)
+                                int tx, int ty,
+                                int *s_progress, int *s_reached)
 {
+    if (ty != 0) return;
+    bool have_anchor = false;
+    float prev_unwr = 0.0f;
+    float prev_wrap = 0.0f;
+    #pragma unroll
     for (int y = UNWRAP_TILE_H - 1; y >= 0; --y) {
-        if (ty == y && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
-            if (ty + 1 < UNWRAP_TILE_H && gy + 1 < ysize
-                && !is_blocked_flag(s_flags[ty + 1][tx])
-                && isfinite(s_soln[ty + 1][tx])) {
-                s_soln[ty][tx] = s_soln[ty + 1][tx]
-                               + device_gradient(s_phase[ty][tx], s_phase[ty + 1][tx]);
-                atomicExch(s_cycle_changed, 1);
-                atomicExch(s_progress, 1);
-                atomicExch(s_reached, 1);
-            }
+        if (is_blocked_flag(s_flags[y][tx])) {
+            have_anchor = false;
+            continue;
         }
-        __syncthreads();
+        if (isfinite(s_soln[y][tx])) {
+            prev_unwr = s_soln[y][tx];
+            prev_wrap = s_phase[y][tx];
+            have_anchor = true;
+            continue;
+        }
+        if (!have_anchor) continue;
+        const float wv = s_phase[y][tx];
+        const float uv = prev_unwr + device_gradient(wv, prev_wrap);
+        s_soln[y][tx] = uv;
+        prev_unwr = uv;
+        prev_wrap = wv;
+        atomicExch(s_progress, 1);
+        atomicExch(s_reached, 1);
     }
 }
 
@@ -619,7 +624,6 @@ __global__ void k_unwrap_frontier_tiles_baseline(
     __shared__ int s_has_seed;
     __shared__ int s_progress;
     __shared__ int s_reached;
-    __shared__ int s_cycle_changed;
     __shared__ int s_incomplete;
 
     const TileTask task = tasks[task_id];
@@ -633,6 +637,8 @@ __global__ void k_unwrap_frontier_tiles_baseline(
     const int gy = base_y + ty;
     const bool in_bounds = (gx < xsize) && (gy < ysize);
 
+    /* Load tile state from global. Out-of-bounds threads pretend to be a
+     * blocked pixel so the sweeps treat them as cut-equivalent. */
     float ph = 0.0f;
     unsigned char fl = kBranchCut | kBorder;
     float prior = nanf("");
@@ -645,61 +651,54 @@ __global__ void k_unwrap_frontier_tiles_baseline(
 
     s_phase[ty][tx] = ph;
     s_flags[ty][tx] = fl;
+    /* Initial s_soln: blocked pixels carry their wrapped phase as a
+     * placeholder (the AVOID-band pass cleans them up later); unblocked
+     * pixels start at NaN unless the global buffer already has a finite
+     * value for them (i.e., they were solved in a prior wave). */
     if (is_blocked_flag(fl))
         s_soln[ty][tx] = ph;
     else
         s_soln[ty][tx] = isfinite(prior) ? prior : nanf("");
 
     if (flat == 0) {
-        s_seed_flat = UNWRAP_TILE_PIXELS;
-        s_has_seed = 0;
-        s_progress = 0;
-        s_reached = 0;
-        s_cycle_changed = 0;
+        s_seed_flat  = UNWRAP_TILE_PIXELS;
+        s_has_seed   = 0;
+        s_progress   = 0;
+        s_reached    = 0;
         s_incomplete = 0;
     }
     __syncthreads();
 
-    if (in_bounds && !is_blocked_flag(fl) && isfinite(s_soln[ty][tx]))
+    /* Any unblocked pixel that already carries a finite value (from a prior
+     * wave) counts as "reached" and serves as an in-tile anchor. */
+    if (in_bounds && !is_blocked_flag(fl) && isfinite(s_soln[ty][tx])) {
         atomicExch(&s_reached, 1);
+        atomicExch(&s_has_seed, 1);
+    }
     __syncthreads();
 
+    /* Paper-faithful seeding: every boundary thread inspects its outside-of-
+     * tile neighbors and seeds itself from the first finite, unblocked one.
+     * This fires regardless of seed_mode -- the directional hint is now used
+     * only to guide the host scheduler, not to restrict per-tile seeding. */
     if (in_bounds && !is_blocked_flag(fl)) {
-        switch (task.seed_mode) {
-            case kTileSeedFromLeft:
-                seed_from_left_neighbor(s_phase, s_flags, s_soln,
-                                        phase, bitflags, soln,
-                                        tx, ty, gx, gy, xsize, ysize,
-                                        &s_has_seed, &s_progress, &s_reached);
-                break;
-            case kTileSeedFromRight:
-                seed_from_right_neighbor(s_phase, s_flags, s_soln,
-                                         phase, bitflags, soln,
-                                         tx, ty, gx, gy, xsize, ysize,
-                                         &s_has_seed, &s_progress, &s_reached);
-                break;
-            case kTileSeedFromTop:
-                seed_from_top_neighbor(s_phase, s_flags, s_soln,
-                                       phase, bitflags, soln,
-                                       tx, ty, gx, gy, xsize, ysize,
-                                       &s_has_seed, &s_progress, &s_reached);
-                break;
-            case kTileSeedFromBottom:
-                seed_from_bottom_neighbor(s_phase, s_flags, s_soln,
-                                          phase, bitflags, soln,
-                                          tx, ty, gx, gy, xsize, ysize,
-                                          &s_has_seed, &s_progress, &s_reached);
-                break;
-            case kTileSeedAny:
-            default:
-                if (!isfinite(s_soln[ty][tx]))
-                    atomicMin(&s_seed_flat, flat);
-                break;
-        }
+        seed_from_outside_neighbors(s_phase, s_flags, s_soln,
+                                    phase, bitflags, soln,
+                                    tx, ty, gx, gy, xsize, ysize,
+                                    &s_has_seed, &s_progress, &s_reached);
+    }
+    __syncthreads();
+
+    /* For the seed tile (DIR_ANY) with no boundary anchor available,
+     * pick an arbitrary first non-blocked pixel as the absolute reference. */
+    if (task.seed_mode == kTileSeedAny && s_has_seed == 0
+        && in_bounds && !is_blocked_flag(fl) && !isfinite(s_soln[ty][tx])) {
+        atomicMin(&s_seed_flat, flat);
     }
     __syncthreads();
 
     if (task.seed_mode == kTileSeedAny
+        && s_has_seed == 0
         && s_seed_flat < UNWRAP_TILE_PIXELS
         && flat == s_seed_flat) {
         s_soln[ty][tx] = s_phase[ty][tx];
@@ -709,80 +708,33 @@ __global__ void k_unwrap_frontier_tiles_baseline(
     }
     __syncthreads();
 
+    /* No anchor anywhere in the tile -- nothing to do this wave. */
     if (s_has_seed == 0 && s_reached == 0) {
         if (flat == 0)
             task_status[task_id] = 0;
         return;
     }
 
-    for (int iter = 0; iter < UNWRAP_TILE_PIXELS; ++iter) {
-        if (flat == 0)
-            s_cycle_changed = 0;
-        __syncthreads();
-
-        switch (task.seed_mode) {
-            case kTileSeedFromLeft:
-                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                break;
-            case kTileSeedFromRight:
-                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                break;
-            case kTileSeedFromTop:
-                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                break;
-            case kTileSeedFromBottom:
-                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                break;
-            case kTileSeedAny:
-            default:
-                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
-                            &s_cycle_changed, &s_progress, &s_reached);
-                break;
-        }
-
-        if (s_cycle_changed == 0)
-            break;
-        __syncthreads();
-    }
-
-    if (flat == 0)
-        s_incomplete = 0;
+    /* Paper Algorithm 6: four sweeps in the order up -> left -> right -> down.
+     * Each sweep is one O(W) or O(H) serial walk per row/column, executed by
+     * a single thread per line; the other 240 threads in the block idle for
+     * that sweep. Total work per tile is bounded by 4 * W * H pixel-touches
+     * (vs ~4 * UNWRAP_TILE_PIXELS sweeps in the old fixpoint loop, each of
+     * which had W internal __syncthreads). One barrier per sweep is enough
+     * because each sweep only writes to s_soln cells the next sweep then
+     * reads. */
+    sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+    __syncthreads();
+    sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+    __syncthreads();
+    sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+    __syncthreads();
+    sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
     __syncthreads();
 
+    /* Tile-completion accounting. A tile is "complete" when every unblocked
+     * pixel inside it has a finite value -- otherwise the host scheduler
+     * will revisit it from another direction in a later wave. */
     if (in_bounds && !is_blocked_flag(s_flags[ty][tx])) {
         if (isfinite(s_soln[ty][tx]))
             atomicExch(&s_reached, 1);
@@ -1480,61 +1432,58 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
             }
         }
 
+        /* One pair of GPU buffers shared across all waves. The lambda below
+         * just reuses these on every call -- previously this code did
+         * cudaMalloc + cudaFree for each wave, which on a 4096^2 image with
+         * a hundred-plus waves was a measurable fraction of total Stage 3
+         * time. Both buffers are sized to tile_count, the largest possible
+         * wave. */
+        TileTask *d_tasks_pool = nullptr;
+        int      *d_status_pool = nullptr;
+        if ((e = cudaMalloc((void **)&d_tasks_pool,
+                            (size_t)tile_count * sizeof(TileTask))) != cudaSuccess) {
+            cuda_fail(e, "malloc baseline tasks pool");
+            return;
+        }
+        if ((e = cudaMalloc((void **)&d_status_pool,
+                            (size_t)tile_count * sizeof(int))) != cudaSuccess) {
+            cuda_fail(e, "malloc baseline status pool");
+            cudaFree(d_tasks_pool);
+            return;
+        }
+
         auto launch_tile_wave = [&](const std::vector<TileTask> &tasks,
                                     std::vector<int> &h_status) -> bool {
             h_status.assign(tasks.size(), 0);
             if (tasks.empty())
                 return true;
 
-            TileTask *d_tasks = nullptr;
-            int *d_status = nullptr;
-            if ((e = cudaMalloc((void **)&d_tasks,
-                                tasks.size() * sizeof(TileTask))) != cudaSuccess) {
-                cuda_fail(e, "malloc baseline tasks");
-                return false;
-            }
-            if ((e = cudaMalloc((void **)&d_status,
-                                tasks.size() * sizeof(int))) != cudaSuccess) {
-                cuda_fail(e, "malloc baseline task status");
-                cudaFree(d_tasks);
-                return false;
-            }
-            if ((e = cudaMemcpy(d_tasks, tasks.data(),
+            if ((e = cudaMemcpy(d_tasks_pool, tasks.data(),
                                 tasks.size() * sizeof(TileTask),
                                 cudaMemcpyHostToDevice)) != cudaSuccess) {
                 cuda_fail(e, "H2D baseline tasks");
-                cudaFree(d_tasks);
-                cudaFree(d_status);
                 return false;
             }
 
             dim3 tile_block(UNWRAP_TILE_W, UNWRAP_TILE_H);
             k_unwrap_frontier_tiles_baseline<<<(unsigned)tasks.size(), tile_block>>>(
                 dev->d_phase, dev->d_bitflags, dev->d_soln,
-                d_tasks, (int)tasks.size(), d_status, xsize, ysize);
+                d_tasks_pool, (int)tasks.size(), d_status_pool, xsize, ysize);
             if ((e = cudaGetLastError()) != cudaSuccess) {
                 cuda_fail(e, "k_unwrap_frontier_tiles_baseline");
-                cudaFree(d_tasks);
-                cudaFree(d_status);
                 return false;
             }
             if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
                 cuda_fail(e, "sync baseline tile wave");
-                cudaFree(d_tasks);
-                cudaFree(d_status);
                 return false;
             }
-            if ((e = cudaMemcpy(h_status.data(), d_status,
+            if ((e = cudaMemcpy(h_status.data(), d_status_pool,
                                 tasks.size() * sizeof(int),
                                 cudaMemcpyDeviceToHost)) != cudaSuccess) {
                 cuda_fail(e, "D2H baseline task status");
-                cudaFree(d_tasks);
-                cudaFree(d_status);
                 return false;
             }
 
-            cudaFree(d_tasks);
-            cudaFree(d_status);
             return true;
         };
 
@@ -1556,8 +1505,11 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
             seed_tasks[0]._pad = 0;
 
             std::vector<int> h_status;
-            if (!launch_tile_wave(seed_tasks, h_status))
+            if (!launch_tile_wave(seed_tasks, h_status)) {
+                cudaFree(d_tasks_pool);
+                cudaFree(d_status_pool);
                 return;
+            }
 
             if (h_status[0] & kTaskStatusReached)
                 tile_reached[seed_tile] = 1;
@@ -1605,8 +1557,11 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
 
                 if (wave.empty())
                     break;
-                if (!launch_tile_wave(wave, h_status))
+                if (!launch_tile_wave(wave, h_status)) {
+                    cudaFree(d_tasks_pool);
+                    cudaFree(d_status_pool);
                     return;
+                }
 
                 int n_progress = 0;
                 for (size_t i = 0; i < wave.size(); ++i) {
@@ -1623,6 +1578,9 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
                     break;
             }
         }
+
+        cudaFree(d_tasks_pool);
+        cudaFree(d_status_pool);
     }
 
 #elif UNWRAP_STAGE3_MODE == kStage3ModeBlockwiseParallel
