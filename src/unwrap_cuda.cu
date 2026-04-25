@@ -397,16 +397,10 @@ __global__ void k_fill_avoid_band(float *__restrict__ soln,
         soln[k] = soln[nidx] + device_gradient(phase[k], phase[nidx]);
 }
 
-/* Paper-faithful boundary seeding: every boundary pixel of the tile inspects
- * each neighbor that lies OUTSIDE the tile and seeds itself from the first
- * one that is non-blocked and finite. All four sides are checked, regardless
- * of seed_mode -- this matches the paper's "scan for first visited anchor"
- * rule and is robust to tiles that have several solved neighbors at once
- * (e.g., during ring-expansion at corners) or have one neighbor side blocked
- * by a cut.
- *
- * Interior pixels are no-ops (none of the boundary conditions hit). */
-__device__ __forceinline__ void seed_from_outside_neighbors(
+/* Baseline seeding: a frontier task may only seed from the side implied by
+ * its entry orientation. This avoids mixing incompatible 2*pi references from
+ * multiple already-solved neighbors inside one tile. */
+__device__ __forceinline__ void seed_from_left_neighbor(
     float s_phase[][UNWRAP_TILE_W],
     unsigned char s_flags[][UNWRAP_TILE_W],
     float s_soln[][UNWRAP_TILE_W],
@@ -416,36 +410,88 @@ __device__ __forceinline__ void seed_from_outside_neighbors(
     int tx, int ty, int gx, int gy, int xsize, int ysize,
     int *s_has_seed, int *s_progress, int *s_reached)
 {
-    if (gx >= xsize || gy >= ysize)
+    if (tx != 0 || gx <= 0 || gy >= ysize)
         return;
     if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
         return;
 
-    /* Probe the four out-of-tile neighbors. First one that is non-blocked
-     * and has a finite global solution wins; we copy its unwrapped value
-     * adjusted by one wrap-difference step. */
-    int nidx = -1;
-    if (tx == 0 && gx > 0) {
-        const int n = gy * xsize + (gx - 1);
-        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
-            nidx = n;
-    }
-    if (nidx < 0 && tx == UNWRAP_TILE_W - 1 && gx + 1 < xsize) {
-        const int n = gy * xsize + (gx + 1);
-        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
-            nidx = n;
-    }
-    if (nidx < 0 && ty == 0 && gy > 0) {
-        const int n = (gy - 1) * xsize + gx;
-        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
-            nidx = n;
-    }
-    if (nidx < 0 && ty == UNWRAP_TILE_H - 1 && gy + 1 < ysize) {
-        const int n = (gy + 1) * xsize + gx;
-        if (is_valid_unwrap_pixel(bitflags, n) && isfinite(solved[n]))
-            nidx = n;
-    }
-    if (nidx < 0)
+    const int nidx = gy * xsize + (gx - 1);
+    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
+        return;
+
+    s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
+    atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
+}
+
+__device__ __forceinline__ void seed_from_right_neighbor(
+    float s_phase[][UNWRAP_TILE_W],
+    unsigned char s_flags[][UNWRAP_TILE_W],
+    float s_soln[][UNWRAP_TILE_W],
+    const float *__restrict__ phase,
+    const unsigned char *__restrict__ bitflags,
+    const float *__restrict__ solved,
+    int tx, int ty, int gx, int gy, int xsize, int ysize,
+    int *s_has_seed, int *s_progress, int *s_reached)
+{
+    if (tx != UNWRAP_TILE_W - 1 || gx + 1 >= xsize || gy >= ysize)
+        return;
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
+        return;
+
+    const int nidx = gy * xsize + (gx + 1);
+    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
+        return;
+
+    s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
+    atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
+}
+
+__device__ __forceinline__ void seed_from_top_neighbor(
+    float s_phase[][UNWRAP_TILE_W],
+    unsigned char s_flags[][UNWRAP_TILE_W],
+    float s_soln[][UNWRAP_TILE_W],
+    const float *__restrict__ phase,
+    const unsigned char *__restrict__ bitflags,
+    const float *__restrict__ solved,
+    int tx, int ty, int gx, int gy, int xsize, int ysize,
+    int *s_has_seed, int *s_progress, int *s_reached)
+{
+    if (ty != 0 || gy <= 0 || gx >= xsize)
+        return;
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
+        return;
+
+    const int nidx = (gy - 1) * xsize + gx;
+    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
+        return;
+
+    s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
+    atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
+}
+
+__device__ __forceinline__ void seed_from_bottom_neighbor(
+    float s_phase[][UNWRAP_TILE_W],
+    unsigned char s_flags[][UNWRAP_TILE_W],
+    float s_soln[][UNWRAP_TILE_W],
+    const float *__restrict__ phase,
+    const unsigned char *__restrict__ bitflags,
+    const float *__restrict__ solved,
+    int tx, int ty, int gx, int gy, int xsize, int ysize,
+    int *s_has_seed, int *s_progress, int *s_reached)
+{
+    if (ty != UNWRAP_TILE_H - 1 || gy + 1 >= ysize || gx >= xsize)
+        return;
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
+        return;
+
+    const int nidx = (gy + 1) * xsize + gx;
+    if (!is_valid_unwrap_pixel(bitflags, nidx) || !isfinite(solved[nidx]))
         return;
 
     s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
@@ -677,26 +723,44 @@ __global__ void k_unwrap_frontier_tiles_baseline(
     }
     __syncthreads();
 
-    /* Paper-faithful seeding: every boundary thread inspects its outside-of-
-     * tile neighbors and seeds itself from the first finite, unblocked one.
-     * This fires regardless of seed_mode -- the directional hint is now used
-     * only to guide the host scheduler, not to restrict per-tile seeding. */
+    /* Seed from exactly one side, matching the tile's entry orientation. */
     if (in_bounds && !is_blocked_flag(fl)) {
-        seed_from_outside_neighbors(s_phase, s_flags, s_soln,
-                                    phase, bitflags, soln,
-                                    tx, ty, gx, gy, xsize, ysize,
-                                    &s_has_seed, &s_progress, &s_reached);
+        switch (task.seed_mode) {
+            case kTileSeedFromLeft:
+                seed_from_left_neighbor(s_phase, s_flags, s_soln,
+                                        phase, bitflags, soln,
+                                        tx, ty, gx, gy, xsize, ysize,
+                                        &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromRight:
+                seed_from_right_neighbor(s_phase, s_flags, s_soln,
+                                         phase, bitflags, soln,
+                                         tx, ty, gx, gy, xsize, ysize,
+                                         &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromTop:
+                seed_from_top_neighbor(s_phase, s_flags, s_soln,
+                                       phase, bitflags, soln,
+                                       tx, ty, gx, gy, xsize, ysize,
+                                       &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromBottom:
+                seed_from_bottom_neighbor(s_phase, s_flags, s_soln,
+                                          phase, bitflags, soln,
+                                          tx, ty, gx, gy, xsize, ysize,
+                                          &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedAny:
+            default:
+                if (s_has_seed == 0 && !isfinite(s_soln[ty][tx]))
+                    atomicMin(&s_seed_flat, flat);
+                break;
+        }
     }
     __syncthreads();
 
-    /* For the seed tile (DIR_ANY) with no boundary anchor available,
-     * pick an arbitrary first non-blocked pixel as the absolute reference. */
-    if (task.seed_mode == kTileSeedAny && s_has_seed == 0
-        && in_bounds && !is_blocked_flag(fl) && !isfinite(s_soln[ty][tx])) {
-        atomicMin(&s_seed_flat, flat);
-    }
-    __syncthreads();
-
+    /* First reference tile: choose one arbitrary valid seed only if the tile
+     * does not already inherit a solved anchor from an earlier revisit. */
     if (task.seed_mode == kTileSeedAny
         && s_has_seed == 0
         && s_seed_flat < UNWRAP_TILE_PIXELS
@@ -715,22 +779,62 @@ __global__ void k_unwrap_frontier_tiles_baseline(
         return;
     }
 
-    /* Paper Algorithm 6: four sweeps in the order up -> left -> right -> down.
-     * Each sweep is one O(W) or O(H) serial walk per row/column, executed by
-     * a single thread per line; the other 240 threads in the block idle for
-     * that sweep. Total work per tile is bounded by 4 * W * H pixel-touches
-     * (vs ~4 * UNWRAP_TILE_PIXELS sweeps in the old fixpoint loop, each of
-     * which had W internal __syncthreads). One barrier per sweep is enough
-     * because each sweep only writes to s_soln cells the next sweep then
-     * reads. */
-    sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
-    __syncthreads();
-    sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
-    __syncthreads();
-    sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
-    __syncthreads();
-    sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
-    __syncthreads();
+    /* Orientation-aware four-pass local solve. The entry side determines the
+     * primary propagation direction; the orthogonal sweeps complete reachable
+     * pixels without imposing a global raster bias. */
+    switch (task.seed_mode) {
+        case kTileSeedFromLeft:
+            sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            break;
+        case kTileSeedFromRight:
+            sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            break;
+        case kTileSeedFromTop:
+            sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            break;
+        case kTileSeedFromBottom:
+            sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            break;
+        case kTileSeedAny:
+        default:
+            sweep_up   (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_left (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_right(s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            sweep_down (s_phase, s_flags, s_soln, tx, ty, &s_progress, &s_reached);
+            __syncthreads();
+            break;
+    }
 
     /* Tile-completion accounting. A tile is "complete" when every unblocked
      * pixel inside it has a finite value -- otherwise the host scheduler
