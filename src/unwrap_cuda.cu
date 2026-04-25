@@ -56,7 +56,7 @@ enum : int {
 };
 
 #ifndef UNWRAP_STAGE3_MODE
-#define UNWRAP_STAGE3_MODE kStage3ModeBaselineSerial
+#define UNWRAP_STAGE3_MODE kStage3ModeBlockwiseParallel
 #endif
 
 constexpr int UNWRAP_TILE_W = 16;
@@ -1093,9 +1093,15 @@ static void solve_tile_offsets_from_seams(const float *h_phase,
         }
     }
 
-    /* Per-edge accumulator: per-pixel integer k votes on the node-pair edge.
-     * Same component across the seam contributes nothing (zero offset). */
-    struct EdgeAccum { double sum_k; int count; };
+    /* Per-edge seam voting. Rather than averaging all seam votes into one
+     * integer, keep a histogram of candidate k offsets and only accept a
+     * seam edge when one integer delta clearly dominates. This prevents a
+     * noisy / cut-adjacent seam from exporting the wrong 2*pi reference far
+     * away from the branch-cut neighborhood. */
+    struct EdgeAccum {
+        std::map<int, int> hist;
+        int count = 0;
+    };
     std::map<std::pair<int, int>, EdgeAccum> edge_map;
 
     auto accumulate_edge = [&](int node_a, int node_b, int k_ab) {
@@ -1104,7 +1110,7 @@ static void solve_tile_offsets_from_seams(const float *h_phase,
         int a = node_a, b = node_b, k = k_ab;
         if (a > b) { std::swap(a, b); k = -k; }
         auto &e = edge_map[{a, b}];
-        e.sum_k += (double)k;
+        e.hist[k] += 1;
         e.count += 1;
     };
 
@@ -1157,22 +1163,50 @@ static void solve_tile_offsets_from_seams(const float *h_phase,
         }
     }
 
-    /* Collapse votes -> one integer delta per edge; build adjacency list. */
+    /* Collapse seam votes -> one integer delta per edge; build adjacency
+     * list. Keep only edges with a clear dominant vote. Ambiguous seams are
+     * dropped so they cannot impose a wrong global offset across many tiles. */
     const int node_count = (int)key_of_node.size();
-    struct Edge { int to; int delta_k; };
+    struct Edge { int to; int delta_k; int support; int total; };
     std::vector<std::vector<Edge>> graph((size_t)node_count);
+    constexpr int kMinSeamSupport = 2;
+    constexpr double kMinSeamAgreement = 0.60;
     for (const auto &kv : edge_map) {
         const int a = kv.first.first;
         const int b = kv.first.second;
-        const int delta = (int)llround(kv.second.sum_k / (double)kv.second.count);
-        graph[a].push_back({b, delta});
-        graph[b].push_back({a, -delta});
+        const EdgeAccum &acc = kv.second;
+        int best_k = 0;
+        int best_count = 0;
+        for (const auto &vote : acc.hist) {
+            if (vote.second > best_count) {
+                best_k = vote.first;
+                best_count = vote.second;
+            }
+        }
+        if (best_count < kMinSeamSupport)
+            continue;
+        const double agree = (double)best_count / (double)acc.count;
+        if (agree < kMinSeamAgreement)
+            continue;
+        graph[a].push_back({b, best_k, best_count, acc.count});
+        graph[b].push_back({a, -best_k, best_count, acc.count});
     }
 
-    /* BFS per connected subgraph: each isolated island gets its own k=0 origin,
-     * matching the C frontier's per-piece behavior. */
+    /* Confidence-ordered BFS per connected subgraph: each isolated island gets
+     * its own k=0 origin, matching the C frontier's per-piece behavior. When
+     * an already-assigned node is revisited through a conflicting edge, keep
+     * the existing assignment and treat the seam as unreliable rather than
+     * letting one bad seam vote rewrite a large region's offset. */
     std::vector<int> node_offsets((size_t)node_count, INT_MAX);
     std::queue<int> q;
+    for (int u = 0; u < node_count; ++u) {
+        std::sort(graph[u].begin(), graph[u].end(),
+                  [](const Edge &a, const Edge &b) {
+                      if (a.support != b.support)
+                          return a.support > b.support;
+                      return a.total > b.total;
+                  });
+    }
     for (int seed = 0; seed < node_count; ++seed) {
         if (node_offsets[seed] != INT_MAX)
             continue;
@@ -1182,10 +1216,12 @@ static void solve_tile_offsets_from_seams(const float *h_phase,
             const int u = q.front();
             q.pop();
             for (const Edge &e : graph[u]) {
+                const int cand = node_offsets[u] + e.delta_k;
                 if (node_offsets[e.to] == INT_MAX) {
-                    node_offsets[e.to] = node_offsets[u] + e.delta_k;
+                    node_offsets[e.to] = cand;
                     q.push(e.to);
                 }
+                /* else: conflicting seam vote -> ignore this edge */
             }
         }
     }
