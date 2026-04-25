@@ -49,6 +49,12 @@ enum : int {
     kStage3ModeBlockwiseParallel = 1,
 };
 
+enum : int {
+    kTaskStatusReached  = 1 << 0,
+    kTaskStatusComplete = 1 << 1,
+    kTaskStatusProgress = 1 << 2,
+};
+
 #ifndef UNWRAP_STAGE3_MODE
 #define UNWRAP_STAGE3_MODE kStage3ModeBaselineSerial
 #endif
@@ -78,12 +84,14 @@ struct TileTask {
 
 __device__ __forceinline__ float device_gradient(float p1, float p2)
 {
-    float r = p1 - p2;
-    if (r > (float)PI)
-        r -= (float)TWOPI;
-    else if (r < -(float)PI)
-        r += (float)TWOPI;
-    return r;
+    const float r = p1 - p2;
+
+    // branchless single-wrap correction:
+    // corr = +1 when r < -PI
+    // corr = -1 when r > +PI
+    // corr =  0 otherwise
+    const float corr = (float)((r < -(float)PI) - (r > (float)PI));
+    return __fmaf_rn(corr, (float)TWOPI, r);
 }
 
 __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
@@ -357,14 +365,10 @@ __global__ void k_init_unwrap_state(const float *__restrict__ phase,
 
 /* AVOID-band fill: mirror the final loop of UnwrapAroundCutsFrontier in main.c.
  * For every blocked (branch-cut / border) pixel, pull a one-step-unwrapped value
- * from a non-blocked left or top neighbor. Without this pass, branch-cut pixels
- * (which include every residue, since residue matching stamps cuts through
- * residue locations) would keep their raw wrapped phase and show up as ~+/-pi
- * speckles all over the output -- the "residues corrupting the image" look.
- *
- * Parallel-safe because reads come only from non-blocked neighbors (their
- * unwrapped values are written by stage 3 and not touched by this pass), so
- * each AVOID pixel writes its own slot with no read/write race. */
+ * from a non-blocked solved neighbor. We probe all four directions rather than
+ * only left/top so the cleanup does not bias the branch-cut halo in one raster
+ * direction. Like the C cleanup, this is a final cosmetic/consistency pass only;
+ * branch-cut pixels are never used as traversal sources during the tiled flood-fill. */
 __global__ void k_fill_avoid_band(float *__restrict__ soln,
                                   const float *__restrict__ phase,
                                   const unsigned char *__restrict__ bitflags,
@@ -372,20 +376,25 @@ __global__ void k_fill_avoid_band(float *__restrict__ soln,
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i < 1 || i >= xsize || j < 1 || j >= ysize)
+    if (i < 0 || i >= xsize || j < 0 || j >= ysize)
         return;
 
     const int k = j * xsize + i;
     if (!is_blocked_flag(bitflags[k]))
         return;
 
-    if (!is_blocked_flag(bitflags[k - 1])
-        && isfinite(soln[k - 1])) {
-        soln[k] = soln[k - 1] + device_gradient(phase[k], phase[k - 1]);
-    } else if (!is_blocked_flag(bitflags[k - xsize])
-               && isfinite(soln[k - xsize])) {
-        soln[k] = soln[k - xsize] + device_gradient(phase[k], phase[k - xsize]);
-    }
+    int nidx = -1;
+    if (i > 0 && !is_blocked_flag(bitflags[k - 1]) && isfinite(soln[k - 1]))
+        nidx = k - 1;
+    else if (j > 0 && !is_blocked_flag(bitflags[k - xsize]) && isfinite(soln[k - xsize]))
+        nidx = k - xsize;
+    else if (i + 1 < xsize && !is_blocked_flag(bitflags[k + 1]) && isfinite(soln[k + 1]))
+        nidx = k + 1;
+    else if (j + 1 < ysize && !is_blocked_flag(bitflags[k + xsize]) && isfinite(soln[k + xsize]))
+        nidx = k + xsize;
+
+    if (nidx >= 0)
+        soln[k] = soln[nidx] + device_gradient(phase[k], phase[nidx]);
 }
 
 __device__ __forceinline__ void seed_from_left_neighbor(
@@ -396,11 +405,11 @@ __device__ __forceinline__ void seed_from_left_neighbor(
     const unsigned char *__restrict__ bitflags,
     const float *__restrict__ solved,
     int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed)
+    int *s_has_seed, int *s_progress, int *s_reached)
 {
     if (tx != 0 || gx <= 0 || gy >= ysize)
         return;
-    if (is_blocked_flag(s_flags[ty][tx]) || !isnan(s_soln[ty][tx]))
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
         return;
 
     const int nidx = gy * xsize + (gx - 1);
@@ -409,6 +418,8 @@ __device__ __forceinline__ void seed_from_left_neighbor(
 
     s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
     atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
 }
 
 __device__ __forceinline__ void seed_from_right_neighbor(
@@ -419,11 +430,11 @@ __device__ __forceinline__ void seed_from_right_neighbor(
     const unsigned char *__restrict__ bitflags,
     const float *__restrict__ solved,
     int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed)
+    int *s_has_seed, int *s_progress, int *s_reached)
 {
     if (tx != UNWRAP_TILE_W - 1 || gx + 1 >= xsize || gy >= ysize)
         return;
-    if (is_blocked_flag(s_flags[ty][tx]) || !isnan(s_soln[ty][tx]))
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
         return;
 
     const int nidx = gy * xsize + (gx + 1);
@@ -432,6 +443,8 @@ __device__ __forceinline__ void seed_from_right_neighbor(
 
     s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
     atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
 }
 
 __device__ __forceinline__ void seed_from_top_neighbor(
@@ -442,11 +455,11 @@ __device__ __forceinline__ void seed_from_top_neighbor(
     const unsigned char *__restrict__ bitflags,
     const float *__restrict__ solved,
     int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed)
+    int *s_has_seed, int *s_progress, int *s_reached)
 {
     if (ty != 0 || gy <= 0 || gx >= xsize)
         return;
-    if (is_blocked_flag(s_flags[ty][tx]) || !isnan(s_soln[ty][tx]))
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
         return;
 
     const int nidx = (gy - 1) * xsize + gx;
@@ -455,6 +468,8 @@ __device__ __forceinline__ void seed_from_top_neighbor(
 
     s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
     atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
 }
 
 __device__ __forceinline__ void seed_from_bottom_neighbor(
@@ -465,11 +480,11 @@ __device__ __forceinline__ void seed_from_bottom_neighbor(
     const unsigned char *__restrict__ bitflags,
     const float *__restrict__ solved,
     int tx, int ty, int gx, int gy, int xsize, int ysize,
-    int *s_has_seed)
+    int *s_has_seed, int *s_progress, int *s_reached)
 {
     if (ty != UNWRAP_TILE_H - 1 || gy + 1 >= ysize || gx >= xsize)
         return;
-    if (is_blocked_flag(s_flags[ty][tx]) || !isnan(s_soln[ty][tx]))
+    if (is_blocked_flag(s_flags[ty][tx]) || isfinite(s_soln[ty][tx]))
         return;
 
     const int nidx = (gy + 1) * xsize + gx;
@@ -478,21 +493,29 @@ __device__ __forceinline__ void seed_from_bottom_neighbor(
 
     s_soln[ty][tx] = solved[nidx] + device_gradient(s_phase[ty][tx], phase[nidx]);
     atomicExch(s_has_seed, 1);
+    atomicExch(s_progress, 1);
+    atomicExch(s_reached, 1);
 }
 
 __device__ inline void sweep_right(float s_phase[][UNWRAP_TILE_W],
                                    unsigned char s_flags[][UNWRAP_TILE_W],
                                    float s_soln[][UNWRAP_TILE_W],
                                    int tx, int ty, int gx, int gy,
-                                   int xsize, int ysize)
+                                   int xsize, int ysize,
+                                   int *s_cycle_changed,
+                                   int *s_progress,
+                                   int *s_reached)
 {
     for (int x = 0; x < UNWRAP_TILE_W; ++x) {
         if (tx == x && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && isnan(s_soln[ty][tx])) {
+            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
             if (tx > 0 && !is_blocked_flag(s_flags[ty][tx - 1])
                 && isfinite(s_soln[ty][tx - 1])) {
                 s_soln[ty][tx] = s_soln[ty][tx - 1]
                                + device_gradient(s_phase[ty][tx], s_phase[ty][tx - 1]);
+                atomicExch(s_cycle_changed, 1);
+                atomicExch(s_progress, 1);
+                atomicExch(s_reached, 1);
             }
         }
         __syncthreads();
@@ -503,16 +526,22 @@ __device__ inline void sweep_left(float s_phase[][UNWRAP_TILE_W],
                                   unsigned char s_flags[][UNWRAP_TILE_W],
                                   float s_soln[][UNWRAP_TILE_W],
                                   int tx, int ty, int gx, int gy,
-                                  int xsize, int ysize)
+                                  int xsize, int ysize,
+                                  int *s_cycle_changed,
+                                  int *s_progress,
+                                  int *s_reached)
 {
     for (int x = UNWRAP_TILE_W - 1; x >= 0; --x) {
         if (tx == x && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && isnan(s_soln[ty][tx])) {
+            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
             if (tx + 1 < UNWRAP_TILE_W && gx + 1 < xsize
                 && !is_blocked_flag(s_flags[ty][tx + 1])
                 && isfinite(s_soln[ty][tx + 1])) {
                 s_soln[ty][tx] = s_soln[ty][tx + 1]
                                + device_gradient(s_phase[ty][tx], s_phase[ty][tx + 1]);
+                atomicExch(s_cycle_changed, 1);
+                atomicExch(s_progress, 1);
+                atomicExch(s_reached, 1);
             }
         }
         __syncthreads();
@@ -523,15 +552,21 @@ __device__ inline void sweep_down(float s_phase[][UNWRAP_TILE_W],
                                   unsigned char s_flags[][UNWRAP_TILE_W],
                                   float s_soln[][UNWRAP_TILE_W],
                                   int tx, int ty, int gx, int gy,
-                                  int xsize, int ysize)
+                                  int xsize, int ysize,
+                                  int *s_cycle_changed,
+                                  int *s_progress,
+                                  int *s_reached)
 {
     for (int y = 0; y < UNWRAP_TILE_H; ++y) {
         if (ty == y && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && isnan(s_soln[ty][tx])) {
+            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
             if (ty > 0 && !is_blocked_flag(s_flags[ty - 1][tx])
                 && isfinite(s_soln[ty - 1][tx])) {
                 s_soln[ty][tx] = s_soln[ty - 1][tx]
                                + device_gradient(s_phase[ty][tx], s_phase[ty - 1][tx]);
+                atomicExch(s_cycle_changed, 1);
+                atomicExch(s_progress, 1);
+                atomicExch(s_reached, 1);
             }
         }
         __syncthreads();
@@ -542,16 +577,22 @@ __device__ inline void sweep_up(float s_phase[][UNWRAP_TILE_W],
                                 unsigned char s_flags[][UNWRAP_TILE_W],
                                 float s_soln[][UNWRAP_TILE_W],
                                 int tx, int ty, int gx, int gy,
-                                int xsize, int ysize)
+                                int xsize, int ysize,
+                                int *s_cycle_changed,
+                                int *s_progress,
+                                int *s_reached)
 {
     for (int y = UNWRAP_TILE_H - 1; y >= 0; --y) {
         if (ty == y && gx < xsize && gy < ysize
-            && !is_blocked_flag(s_flags[ty][tx]) && isnan(s_soln[ty][tx])) {
+            && !is_blocked_flag(s_flags[ty][tx]) && !isfinite(s_soln[ty][tx])) {
             if (ty + 1 < UNWRAP_TILE_H && gy + 1 < ysize
                 && !is_blocked_flag(s_flags[ty + 1][tx])
                 && isfinite(s_soln[ty + 1][tx])) {
                 s_soln[ty][tx] = s_soln[ty + 1][tx]
                                + device_gradient(s_phase[ty][tx], s_phase[ty + 1][tx]);
+                atomicExch(s_cycle_changed, 1);
+                atomicExch(s_progress, 1);
+                atomicExch(s_reached, 1);
             }
         }
         __syncthreads();
@@ -564,7 +605,7 @@ __global__ void k_unwrap_frontier_tiles_baseline(
     float *__restrict__ soln,
     const TileTask *__restrict__ tasks,
     int task_count,
-    int *__restrict__ task_success,
+    int *__restrict__ task_status,
     int xsize, int ysize)
 {
     const int task_id = blockIdx.x;
@@ -576,7 +617,10 @@ __global__ void k_unwrap_frontier_tiles_baseline(
     __shared__ unsigned char s_flags[UNWRAP_TILE_H][UNWRAP_TILE_W];
     __shared__ int s_seed_flat;
     __shared__ int s_has_seed;
-    __shared__ int s_success;
+    __shared__ int s_progress;
+    __shared__ int s_reached;
+    __shared__ int s_cycle_changed;
+    __shared__ int s_incomplete;
 
     const TileTask task = tasks[task_id];
     const int base_x = task.tile_x * UNWRAP_TILE_W;
@@ -591,101 +635,177 @@ __global__ void k_unwrap_frontier_tiles_baseline(
 
     float ph = 0.0f;
     unsigned char fl = kBranchCut | kBorder;
+    float prior = nanf("");
     if (in_bounds) {
         const int idx = gy * xsize + gx;
         ph = phase[idx];
         fl = bitflags[idx];
+        prior = soln[idx];
     }
 
     s_phase[ty][tx] = ph;
     s_flags[ty][tx] = fl;
-    s_soln [ty][tx] = is_blocked_flag(fl) ? ph : nanf("");
+    if (is_blocked_flag(fl))
+        s_soln[ty][tx] = ph;
+    else
+        s_soln[ty][tx] = isfinite(prior) ? prior : nanf("");
 
     if (flat == 0) {
         s_seed_flat = UNWRAP_TILE_PIXELS;
         s_has_seed = 0;
-        s_success = 0;
+        s_progress = 0;
+        s_reached = 0;
+        s_cycle_changed = 0;
+        s_incomplete = 0;
     }
+    __syncthreads();
+
+    if (in_bounds && !is_blocked_flag(fl) && isfinite(s_soln[ty][tx]))
+        atomicExch(&s_reached, 1);
     __syncthreads();
 
     if (in_bounds && !is_blocked_flag(fl)) {
-        seed_from_left_neighbor(s_phase, s_flags, s_soln,
-                                phase, bitflags, soln,
-                                tx, ty, gx, gy, xsize, ysize, &s_has_seed);
-        seed_from_right_neighbor(s_phase, s_flags, s_soln,
-                                 phase, bitflags, soln,
-                                 tx, ty, gx, gy, xsize, ysize, &s_has_seed);
-        seed_from_top_neighbor(s_phase, s_flags, s_soln,
-                               phase, bitflags, soln,
-                               tx, ty, gx, gy, xsize, ysize, &s_has_seed);
-        seed_from_bottom_neighbor(s_phase, s_flags, s_soln,
-                                  phase, bitflags, soln,
-                                  tx, ty, gx, gy, xsize, ysize, &s_has_seed);
+        switch (task.seed_mode) {
+            case kTileSeedFromLeft:
+                seed_from_left_neighbor(s_phase, s_flags, s_soln,
+                                        phase, bitflags, soln,
+                                        tx, ty, gx, gy, xsize, ysize,
+                                        &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromRight:
+                seed_from_right_neighbor(s_phase, s_flags, s_soln,
+                                         phase, bitflags, soln,
+                                         tx, ty, gx, gy, xsize, ysize,
+                                         &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromTop:
+                seed_from_top_neighbor(s_phase, s_flags, s_soln,
+                                       phase, bitflags, soln,
+                                       tx, ty, gx, gy, xsize, ysize,
+                                       &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromBottom:
+                seed_from_bottom_neighbor(s_phase, s_flags, s_soln,
+                                          phase, bitflags, soln,
+                                          tx, ty, gx, gy, xsize, ysize,
+                                          &s_has_seed, &s_progress, &s_reached);
+                break;
+            case kTileSeedAny:
+            default:
+                if (!isfinite(s_soln[ty][tx]))
+                    atomicMin(&s_seed_flat, flat);
+                break;
+        }
     }
     __syncthreads();
 
-    if (task.seed_mode == kTileSeedAny && in_bounds && !is_blocked_flag(fl))
-        atomicMin(&s_seed_flat, flat);
-    __syncthreads();
-
-    if (task.seed_mode == kTileSeedAny && s_has_seed == 0 && flat == s_seed_flat) {
+    if (task.seed_mode == kTileSeedAny
+        && s_seed_flat < UNWRAP_TILE_PIXELS
+        && flat == s_seed_flat) {
         s_soln[ty][tx] = s_phase[ty][tx];
         atomicExch(&s_has_seed, 1);
+        atomicExch(&s_progress, 1);
+        atomicExch(&s_reached, 1);
     }
     __syncthreads();
 
-    if (s_has_seed == 0) {
+    if (s_has_seed == 0 && s_reached == 0) {
         if (flat == 0)
-            task_success[task_id] = 0;
+            task_status[task_id] = 0;
         return;
     }
 
-    switch (task.seed_mode) {
-        case kTileSeedFromLeft:
-            sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            break;
-        case kTileSeedFromRight:
-            sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            break;
-        case kTileSeedFromTop:
-            sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            break;
-        case kTileSeedFromBottom:
-            sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            break;
-        case kTileSeedAny:
-        default:
-            sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize);
-            break;
-    }
+    for (int iter = 0; iter < UNWRAP_TILE_PIXELS; ++iter) {
+        if (flat == 0)
+            s_cycle_changed = 0;
+        __syncthreads();
 
-    if (in_bounds && !is_blocked_flag(s_flags[ty][tx]) && isfinite(s_soln[ty][tx]))
-        atomicExch(&s_success, 1);
-    __syncthreads();
+        switch (task.seed_mode) {
+            case kTileSeedFromLeft:
+                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromRight:
+                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromTop:
+                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                break;
+            case kTileSeedFromBottom:
+                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                break;
+            case kTileSeedAny:
+            default:
+                sweep_right(s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_down (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_left (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                sweep_up   (s_phase, s_flags, s_soln, tx, ty, gx, gy, xsize, ysize,
+                            &s_cycle_changed, &s_progress, &s_reached);
+                break;
+        }
 
-    if (in_bounds) {
-        const int idx = gy * xsize + gx;
-        if (isfinite(s_soln[ty][tx]))
-            soln[idx] = s_soln[ty][tx];
+        if (s_cycle_changed == 0)
+            break;
+        __syncthreads();
     }
 
     if (flat == 0)
-        task_success[task_id] = s_success;
+        s_incomplete = 0;
+    __syncthreads();
+
+    if (in_bounds && !is_blocked_flag(s_flags[ty][tx])) {
+        if (isfinite(s_soln[ty][tx]))
+            atomicExch(&s_reached, 1);
+        else
+            atomicExch(&s_incomplete, 1);
+    }
+    __syncthreads();
+
+    if (in_bounds && isfinite(s_soln[ty][tx])) {
+        const int idx = gy * xsize + gx;
+        soln[idx] = s_soln[ty][tx];
+    }
+
+    if (flat == 0) {
+        int status = 0;
+        if (s_reached)
+            status |= kTaskStatusReached;
+        if (!s_incomplete)
+            status |= kTaskStatusComplete;
+        if (s_progress)
+            status |= kTaskStatusProgress;
+        task_status[task_id] = status;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1350,7 +1470,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
         const int tile_count = tiles_x * tiles_y;
 
         std::vector<unsigned char> tile_has_signal((size_t)tile_count, 0);
-        std::vector<unsigned char> tile_solved((size_t)tile_count, 0);
+        std::vector<unsigned char> tile_reached((size_t)tile_count, 0);
+        std::vector<unsigned char> tile_complete((size_t)tile_count, 0);
         for (int ty = 0; ty < tiles_y; ++ty) {
             for (int tx = 0; tx < tiles_x; ++tx) {
                 const int tile_id = ty * tiles_x + tx;
@@ -1359,86 +1480,94 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
             }
         }
 
-        /* Multi-component outer loop: each iteration picks the next unsolved
-         * signal tile as a fresh seed (kTileSeedAny) and BFS-expands the wave
-         * front from it, mirroring the per-piece seeding the C frontier does
-         * via num_pieces++. Without this, any cut-isolated component without
-         * a tile-edge link to the very first seed would never be unwrapped
-         * and its pixels would fall through to raw wrapped phase. */
+        auto launch_tile_wave = [&](const std::vector<TileTask> &tasks,
+                                    std::vector<int> &h_status) -> bool {
+            h_status.assign(tasks.size(), 0);
+            if (tasks.empty())
+                return true;
+
+            TileTask *d_tasks = nullptr;
+            int *d_status = nullptr;
+            if ((e = cudaMalloc((void **)&d_tasks,
+                                tasks.size() * sizeof(TileTask))) != cudaSuccess) {
+                cuda_fail(e, "malloc baseline tasks");
+                return false;
+            }
+            if ((e = cudaMalloc((void **)&d_status,
+                                tasks.size() * sizeof(int))) != cudaSuccess) {
+                cuda_fail(e, "malloc baseline task status");
+                cudaFree(d_tasks);
+                return false;
+            }
+            if ((e = cudaMemcpy(d_tasks, tasks.data(),
+                                tasks.size() * sizeof(TileTask),
+                                cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "H2D baseline tasks");
+                cudaFree(d_tasks);
+                cudaFree(d_status);
+                return false;
+            }
+
+            dim3 tile_block(UNWRAP_TILE_W, UNWRAP_TILE_H);
+            k_unwrap_frontier_tiles_baseline<<<(unsigned)tasks.size(), tile_block>>>(
+                dev->d_phase, dev->d_bitflags, dev->d_soln,
+                d_tasks, (int)tasks.size(), d_status, xsize, ysize);
+            if ((e = cudaGetLastError()) != cudaSuccess) {
+                cuda_fail(e, "k_unwrap_frontier_tiles_baseline");
+                cudaFree(d_tasks);
+                cudaFree(d_status);
+                return false;
+            }
+            if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
+                cuda_fail(e, "sync baseline tile wave");
+                cudaFree(d_tasks);
+                cudaFree(d_status);
+                return false;
+            }
+            if ((e = cudaMemcpy(h_status.data(), d_status,
+                                tasks.size() * sizeof(int),
+                                cudaMemcpyDeviceToHost)) != cudaSuccess) {
+                cuda_fail(e, "D2H baseline task status");
+                cudaFree(d_tasks);
+                cudaFree(d_status);
+                return false;
+            }
+
+            cudaFree(d_tasks);
+            cudaFree(d_status);
+            return true;
+        };
+
         while (true) {
             int seed_tile = -1;
             for (int tile_id = 0; tile_id < tile_count; ++tile_id) {
-                if (tile_has_signal[tile_id] && !tile_solved[tile_id]) {
+                if (tile_has_signal[tile_id] && !tile_complete[tile_id]) {
                     seed_tile = tile_id;
                     break;
                 }
             }
             if (seed_tile < 0)
                 break;
-            {
-            std::vector<TileTask> frontier(1);
-            frontier[0].tile_x = seed_tile % tiles_x;
-            frontier[0].tile_y = seed_tile / tiles_x;
-            frontier[0].seed_mode = kTileSeedAny;
-            frontier[0]._pad = 0;
 
-            TileTask *d_tasks = nullptr;
-            int *d_success = nullptr;
-            if ((e = cudaMalloc((void **)&d_tasks,
-                                frontier.size() * sizeof(TileTask))) != cudaSuccess) {
-                cuda_fail(e, "malloc baseline seed tasks");
-                return;
-            }
-            if ((e = cudaMalloc((void **)&d_success,
-                                frontier.size() * sizeof(int))) != cudaSuccess) {
-                cuda_fail(e, "malloc baseline seed success");
-                cudaFree(d_tasks);
-                return;
-            }
-            if ((e = cudaMemcpy(d_tasks, frontier.data(),
-                                frontier.size() * sizeof(TileTask),
-                                cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "H2D baseline seed tasks");
-                cudaFree(d_tasks);
-                cudaFree(d_success);
-                return;
-            }
+            std::vector<TileTask> seed_tasks(1);
+            seed_tasks[0].tile_x = seed_tile % tiles_x;
+            seed_tasks[0].tile_y = seed_tile / tiles_x;
+            seed_tasks[0].seed_mode = kTileSeedAny;
+            seed_tasks[0]._pad = 0;
 
-            dim3 tile_block(UNWRAP_TILE_W, UNWRAP_TILE_H);
-            k_unwrap_frontier_tiles_baseline<<<(unsigned)frontier.size(), tile_block>>>(
-                dev->d_phase, dev->d_bitflags, dev->d_soln,
-                d_tasks, (int)frontier.size(), d_success, xsize, ysize);
-            if ((e = cudaGetLastError()) != cudaSuccess) {
-                cuda_fail(e, "k_unwrap_frontier_tiles_baseline(seed)");
-                cudaFree(d_tasks);
-                cudaFree(d_success);
+            std::vector<int> h_status;
+            if (!launch_tile_wave(seed_tasks, h_status))
                 return;
-            }
-            if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
-                cuda_fail(e, "sync baseline seed");
-                cudaFree(d_tasks);
-                cudaFree(d_success);
-                return;
-            }
 
-            int h_success = 0;
-            if ((e = cudaMemcpy(&h_success, d_success, sizeof(int),
-                                cudaMemcpyDeviceToHost)) != cudaSuccess) {
-                cuda_fail(e, "D2H baseline seed success");
-                cudaFree(d_tasks);
-                cudaFree(d_success);
-                return;
-            }
-            cudaFree(d_tasks);
-            cudaFree(d_success);
-
-            if (h_success)
-                tile_solved[seed_tile] = 1;
+            if (h_status[0] & kTaskStatusReached)
+                tile_reached[seed_tile] = 1;
+            if (h_status[0] & kTaskStatusComplete)
+                tile_complete[seed_tile] = 1;
 
             while (true) {
                 std::vector<int> candidate_mode((size_t)tile_count, -1);
                 for (int tile_id = 0; tile_id < tile_count; ++tile_id) {
-                    if (!tile_solved[tile_id])
+                    if (!tile_reached[tile_id])
                         continue;
                     const int tx = tile_id % tiles_x;
                     const int ty = tile_id / tiles_x;
@@ -1451,7 +1580,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
                         if (cx < 0 || cx >= tiles_x || cy < 0 || cy >= tiles_y)
                             continue;
                         const int cid = cy * tiles_x + cx;
-                        if (tile_solved[cid] || !tile_has_signal[cid])
+                        if (tile_complete[cid] || !tile_has_signal[cid])
                             continue;
                         if (candidate_mode[cid] < 0)
                             candidate_mode[cid] = mode_from_solved_neighbor(cx, cy, tx, ty);
@@ -1459,8 +1588,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
                 }
 
                 std::vector<TileTask> wave;
-                wave.reserve((size_t)tile_count);
                 std::vector<int> wave_ids;
+                wave.reserve((size_t)tile_count);
                 wave_ids.reserve((size_t)tile_count);
                 for (int tile_id = 0; tile_id < tile_count; ++tile_id) {
                     if (candidate_mode[tile_id] < 0)
@@ -1476,68 +1605,22 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
 
                 if (wave.empty())
                     break;
+                if (!launch_tile_wave(wave, h_status))
+                    return;
 
-                TileTask *d_tasks = nullptr;
-                int *d_success = nullptr;
-                if ((e = cudaMalloc((void **)&d_tasks,
-                                    wave.size() * sizeof(TileTask))) != cudaSuccess) {
-                    cuda_fail(e, "malloc baseline wave tasks");
-                    return;
-                }
-                if ((e = cudaMalloc((void **)&d_success,
-                                    wave.size() * sizeof(int))) != cudaSuccess) {
-                    cuda_fail(e, "malloc baseline wave success");
-                    cudaFree(d_tasks);
-                    return;
-                }
-                if ((e = cudaMemcpy(d_tasks, wave.data(),
-                                    wave.size() * sizeof(TileTask),
-                                    cudaMemcpyHostToDevice)) != cudaSuccess) {
-                    cuda_fail(e, "H2D baseline wave tasks");
-                    cudaFree(d_tasks);
-                    cudaFree(d_success);
-                    return;
-                }
-
-                dim3 tile_block(UNWRAP_TILE_W, UNWRAP_TILE_H);
-                k_unwrap_frontier_tiles_baseline<<<(unsigned)wave.size(), tile_block>>>(
-                    dev->d_phase, dev->d_bitflags, dev->d_soln,
-                    d_tasks, (int)wave.size(), d_success, xsize, ysize);
-                if ((e = cudaGetLastError()) != cudaSuccess) {
-                    cuda_fail(e, "k_unwrap_frontier_tiles_baseline(wave)");
-                    cudaFree(d_tasks);
-                    cudaFree(d_success);
-                    return;
-                }
-                if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
-                    cuda_fail(e, "sync baseline wave");
-                    cudaFree(d_tasks);
-                    cudaFree(d_success);
-                    return;
-                }
-
-                std::vector<int> h_success(wave.size(), 0);
-                if ((e = cudaMemcpy(h_success.data(), d_success,
-                                    wave.size() * sizeof(int),
-                                    cudaMemcpyDeviceToHost)) != cudaSuccess) {
-                    cuda_fail(e, "D2H baseline wave success");
-                    cudaFree(d_tasks);
-                    cudaFree(d_success);
-                    return;
-                }
-                cudaFree(d_tasks);
-                cudaFree(d_success);
-
-                int n_new = 0;
+                int n_progress = 0;
                 for (size_t i = 0; i < wave.size(); ++i) {
-                    if (h_success[i]) {
-                        tile_solved[wave_ids[i]] = 1;
-                        ++n_new;
-                    }
+                    const int tile_id = wave_ids[i];
+                    const int status = h_status[i];
+                    if (status & kTaskStatusReached)
+                        tile_reached[tile_id] = 1;
+                    if (status & kTaskStatusComplete)
+                        tile_complete[tile_id] = 1;
+                    if (status & kTaskStatusProgress)
+                        ++n_progress;
                 }
-                if (n_new == 0)
+                if (n_progress == 0)
                     break;
-            }
             }
         }
     }
