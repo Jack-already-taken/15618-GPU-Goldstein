@@ -1199,8 +1199,10 @@ static void soln_diff_stats(const float *a, const float *b, int n,
  *                                frontier unwrap (omp_avoid_pass = 1).
  *  UNWRAP_BACKEND_SERIAL_CPU   — Serial residues + serial branch cuts +
  *                                frontier unwrap (omp_avoid_pass = 0).
- *  UNWRAP_BACKEND_CUDA_STUB    — CPU residues, branch cuts, and unwrap; CUDA used
- *                                only for the residue-matching launch (device hook).
+ *  UNWRAP_BACKEND_CUDA_STUB    — All three stages (residue identification,
+ *                                residue matching / branch cuts, and unwrap)
+ *                                run on the GPU when device buffers are
+ *                                available; falls back to CPU per-stage if not.
  * -------------------------------------------------------------------- */
 
 #define UNWRAP_BACKEND_PARALLEL_CPU 0
@@ -1324,20 +1326,45 @@ static void run_unwrap_kernel_cuda(
     UnwrapKernelResult *out)
 {
     clock_t ta, tb;
-    int      MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
+    int     MaxCutLen   = (ctx->xsize + ctx->ysize) / 2;
+    int     have_device = (ctx->cuda_dev.d_phase != NULL
+                           && ctx->cuda_dev.d_bitflags != NULL
+                           && ctx->cuda_dev.d_soln != NULL);
 
-    /* Residues: CPU (serial), same as serial_cpu backend. */
-    ta = clock();
-    out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
-                                        ctx->xsize, ctx->ysize);
-    tb = clock();
-    out->ms_residues = timediff(ta, tb);
+    out->ms_cuda_residue_match = 0.0;
+
+    /* Stage 1: residue identification on the GPU. */
+    if (have_device) {
+        ta = clock();
+        int rc = unwrap_cuda_launch_residue_identification(
+            ctx->phase, ctx->bitflags, &ctx->cuda_dev,
+            ctx->xsize, ctx->ysize, ctx->length);
+        tb = clock();
+        if (rc < 0) {
+            fprintf(stderr,
+                    "unwrap backend 'cuda': residue-identification kernel failed "
+                    "(rc=%d); falling back to CPU.\n", rc);
+            ta = clock();
+            out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+                                                ctx->xsize, ctx->ysize);
+            tb = clock();
+        } else {
+            out->num_residues = rc;
+        }
+        out->ms_residues = timediff(ta, tb);
+    } else {
+        ta = clock();
+        out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+                                            ctx->xsize, ctx->ysize);
+        tb = clock();
+        out->ms_residues = timediff(ta, tb);
+    }
 
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
 
-    /* Residue matching: CUDA only (uses d_bitflags); skipped if alloc failed. */
-    if (ctx->cuda_dev.d_bitflags) {
+    /* Stage 2: residue matching / branch cuts on the GPU. */
+    if (have_device) {
         ta = clock();
         unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
                                             out->num_residues, ctx->xsize, ctx->ysize,
@@ -1345,13 +1372,12 @@ static void run_unwrap_kernel_cuda(
         tb = clock();
         out->ms_branch_cuts = timediff(ta, tb);
     } else {
-        out->ms_branch_cuts = 0.0;
         fprintf(stderr,
-                "unwrap backend 'cuda': no d_bitflags; skipping CUDA residue-matching "
-                "kernel.\n");
+                "unwrap backend 'cuda': no device buffers; running CPU "
+                "branch-cut fallback.\n");
         ta = clock();
         GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
-                                ctx->xsize, ctx->ysize);
+                                   ctx->xsize, ctx->ysize);
         tb = clock();
         out->ms_branch_cuts = timediff(ta, tb);
     }
@@ -1359,12 +1385,25 @@ static void run_unwrap_kernel_cuda(
     if (verify_effective && bf_preunwrap)
         memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
 
-    ta = clock();
-    out->num_pieces = UnwrapAroundCutsFrontier(
-        ctx->phase, ctx->bitflags, ctx->soln, ctx->xsize, ctx->ysize,
-        ctx->path_order, ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
-    tb = clock();
-    out->ms_unwrap = timediff(ta, tb);
+    /* Stage 3: unwrap on the GPU (tile-frontier or block-wise per build flag). */
+    if (have_device) {
+        ta = clock();
+        unwrap_cuda_launch_unwrapping(ctx->phase, ctx->bitflags, ctx->soln,
+                                      &ctx->cuda_dev,
+                                      ctx->xsize, ctx->ysize, ctx->length);
+        tb = clock();
+        out->ms_unwrap = timediff(ta, tb);
+        /* The CUDA unwrap path does not enumerate connected components the way
+         * UnwrapAroundCutsFrontier does; report 0 so the field stays defined. */
+        out->num_pieces = 0;
+    } else {
+        ta = clock();
+        out->num_pieces = UnwrapAroundCutsFrontier(
+            ctx->phase, ctx->bitflags, ctx->soln, ctx->xsize, ctx->ysize,
+            ctx->path_order, ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
+        tb = clock();
+        out->ms_unwrap = timediff(ta, tb);
+    }
 
     out->elapsed_ms = out->ms_residues + out->ms_cuda_residue_match
         + out->ms_branch_cuts + out->ms_unwrap;
