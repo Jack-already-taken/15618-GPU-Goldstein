@@ -355,6 +355,39 @@ __global__ void k_init_unwrap_state(const float *__restrict__ phase,
     soln[idx] = is_blocked_flag(bitflags[idx]) ? phase[idx] : nanf("");
 }
 
+/* AVOID-band fill: mirror the final loop of UnwrapAroundCutsFrontier in main.c.
+ * For every blocked (branch-cut / border) pixel, pull a one-step-unwrapped value
+ * from a non-blocked left or top neighbor. Without this pass, branch-cut pixels
+ * (which include every residue, since residue matching stamps cuts through
+ * residue locations) would keep their raw wrapped phase and show up as ~+/-pi
+ * speckles all over the output -- the "residues corrupting the image" look.
+ *
+ * Parallel-safe because reads come only from non-blocked neighbors (their
+ * unwrapped values are written by stage 3 and not touched by this pass), so
+ * each AVOID pixel writes its own slot with no read/write race. */
+__global__ void k_fill_avoid_band(float *__restrict__ soln,
+                                  const float *__restrict__ phase,
+                                  const unsigned char *__restrict__ bitflags,
+                                  int xsize, int ysize)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < 1 || i >= xsize || j < 1 || j >= ysize)
+        return;
+
+    const int k = j * xsize + i;
+    if (!is_blocked_flag(bitflags[k]))
+        return;
+
+    if (!is_blocked_flag(bitflags[k - 1])
+        && isfinite(soln[k - 1])) {
+        soln[k] = soln[k - 1] + device_gradient(phase[k], phase[k - 1]);
+    } else if (!is_blocked_flag(bitflags[k - xsize])
+               && isfinite(soln[k - xsize])) {
+        soln[k] = soln[k - xsize] + device_gradient(phase[k], phase[k - xsize]);
+    }
+}
+
 __device__ __forceinline__ void seed_from_left_neighbor(
     float s_phase[][UNWRAP_TILE_W],
     unsigned char s_flags[][UNWRAP_TILE_W],
@@ -1326,15 +1359,23 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
             }
         }
 
-        int seed_tile = -1;
-        for (int tile_id = 0; tile_id < tile_count; ++tile_id) {
-            if (tile_has_signal[tile_id]) {
-                seed_tile = tile_id;
-                break;
+        /* Multi-component outer loop: each iteration picks the next unsolved
+         * signal tile as a fresh seed (kTileSeedAny) and BFS-expands the wave
+         * front from it, mirroring the per-piece seeding the C frontier does
+         * via num_pieces++. Without this, any cut-isolated component without
+         * a tile-edge link to the very first seed would never be unwrapped
+         * and its pixels would fall through to raw wrapped phase. */
+        while (true) {
+            int seed_tile = -1;
+            for (int tile_id = 0; tile_id < tile_count; ++tile_id) {
+                if (tile_has_signal[tile_id] && !tile_solved[tile_id]) {
+                    seed_tile = tile_id;
+                    break;
+                }
             }
-        }
-
-        if (seed_tile >= 0) {
+            if (seed_tile < 0)
+                break;
+            {
             std::vector<TileTask> frontier(1);
             frontier[0].tile_x = seed_tile % tiles_x;
             frontier[0].tile_y = seed_tile / tiles_x;
@@ -1497,6 +1538,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
                 if (n_new == 0)
                     break;
             }
+            }
         }
     }
 
@@ -1591,6 +1633,26 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
 #else
 #error "Unsupported UNWRAP_STAGE3_MODE"
 #endif
+
+    /* AVOID-band fill: stamp branch-cut / border pixels with a one-step
+     * unwrap from a non-blocked neighbor, matching the tail of
+     * UnwrapAroundCutsFrontier. Without this, residue pixels (which all carry
+     * the BRANCH_CUT flag after stage 2) display as raw wrapped phase. */
+    {
+        dim3 fill_block(16, 16);
+        dim3 fill_grid(div_up_int(xsize, 16), div_up_int(ysize, 16));
+        k_fill_avoid_band<<<fill_grid, fill_block>>>(dev->d_soln, dev->d_phase,
+                                                     dev->d_bitflags,
+                                                     xsize, ysize);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_fill_avoid_band");
+            return;
+        }
+        if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
+            cuda_fail(e, "sync fill avoid band");
+            return;
+        }
+    }
 
     if ((e = cudaMemcpy(h_soln, dev->d_soln,
                         (size_t)length * sizeof(float),
