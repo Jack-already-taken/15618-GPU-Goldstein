@@ -17,13 +17,6 @@ constexpr unsigned char kUnwrapped  = 0x40;
 enum : unsigned char { kPosRes = 0x01, kNegRes = 0x02, kBorder = 0x20, kBranchCut = 0x10 };
 constexpr unsigned char kAvoid = kBranchCut | kBorder;
 
-static int cuda_fail(cudaError_t err, const char *where)
-{
-    if (err == cudaSuccess) return 0;
-    fprintf(stderr, "CUDA error at %s: %s\n", where, cudaGetErrorString(err));
-    return (int)err;
-}
-
 __device__ __forceinline__ float device_gradient(float p1, float p2)
 {
     float r = p1 - p2;
@@ -40,6 +33,14 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
     unsigned int bit   = (unsigned int)kUnwrapped << ((idx & 3) * 8);
     unsigned int old   = atomicOr(word, bit);
     return !(old & bit);
+}
+
+static int cuda_fail(cudaError_t e, const char *msg)
+{
+    if (e == cudaSuccess)
+        return 0;
+    fprintf(stderr, "unwrap_cuda: %s: %s\n", msg, cudaGetErrorString(e));
+    return (int)e;
 }
 
 // __global__ void k_identify_residues(const float *phase, unsigned char *bitflags, int xsize,
@@ -228,6 +229,17 @@ static inline float host_wrap_diff(float p1, float p2)
     return r;
 }
 
+
+static inline float host_gradient(float p1, float p2)
+{
+    float r = p1 - p2;
+    if (r > (float)PI)
+        r -= (float)TWOPI;
+    else if (r < -(float)PI)
+        r += (float)TWOPI;
+    return r;
+}
+
 static inline int div_up_int(int a, int b)
 {
     return (a + b - 1) / b;
@@ -394,6 +406,19 @@ __global__ void k_rasterize_cuts(const int *__restrict__ d_pairs,
  *   [4] total branch-cut pixels
  *   [5] branch-cut pixels touching image border
  */
+
+/* ------------------------------------------------------------------------- */
+/*  Kernel: force every residue pixel to be part of the branch-cut mask       */
+/* ------------------------------------------------------------------------- */
+__global__ void k_mark_residues_as_branch_cuts(unsigned char *__restrict__ bitflags,
+                                               int length)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= length) return;
+    if (bitflags[k] & (kPosRes | kNegRes))
+        bitflags[k] |= kBranchCut;
+}
+
 __global__ void k_verify_stage2_branchcuts(const unsigned char *__restrict__ bitflags,
                                            int length, int xsize, int ysize,
                                            int *__restrict__ stats)
@@ -915,6 +940,16 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
         }
     }
 
+    /* Safety/correctness fix: Goldstein cuts must include residue endpoints. */
+    {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (length + threads - 1) / threads;
+        k_mark_residues_as_branch_cuts<<<blocks, threads>>>(dev->d_bitflags, length);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_mark_residues_as_branch_cuts"); return;
+        }
+    }
+
     if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
         cuda_fail(e, "sync after stage 2"); return;
     }
@@ -934,122 +969,108 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     const UnwrapCudaDeviceBufs *dev,
     int xsize, int ysize, int length)
 {
+    (void)dev;
+
     if (length < 1 || !h_phase || !h_bitflags || !h_soln || !h_gradx || !h_grady
-        || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
-        || !dev->d_gradx || !dev->d_grady
-        || !dev->d_frontier_a || !dev->d_frontier_b
-        || !dev->d_frontier_count_a || !dev->d_frontier_count_b)
+        || xsize < 1 || ysize < 1 || length != xsize * ysize)
         return;
 
-    cudaError_t e;
-
-    /* Seed one pixel per connected component on CPU,
-       matching UnwrapAroundCutsFrontier logic exactly */
-    constexpr unsigned char kAvoidU = kBranchCut | kBorder;
-    int h_frontier_count = 0;
-    int *h_frontier_tmp = (int*)malloc((size_t)length * sizeof(int));
-
-    // Find one seed per connected component
-for (int k = 0; k < length; k++) {
-    if (!(h_bitflags[k] & (kAvoidU | kUnwrapped))) {
-        h_soln[k] = h_phase[k];
-        h_bitflags[k] |= kUnwrapped;
-        h_frontier_tmp[h_frontier_count++] = k;
-
-        // flood-fill to mark rest of this component so outer loop skips them
-        int *stk = (int*)malloc((size_t)length * sizeof(int));
-        int top = 0;
-        stk[top++] = k;
-        while (top > 0) {
-            int cur = stk[--top];
-            int cx = cur % xsize, cy = cur / xsize;
-            int nb;
-            if (cx > 0)        { nb = cur-1;      if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
-            if (cx < xsize-1)  { nb = cur+1;      if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
-            if (cy > 0)        { nb = cur-xsize;  if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
-            if (cy < ysize-1)  { nb = cur+xsize;  if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
-        }
-        free(stk);
-    }
-}
-
-// Reset kUnwrapped everywhere, then re-mark only seeds
-for (int k = 0; k < length; k++)
-    h_bitflags[k] &= ~kUnwrapped;
-for (int i = 0; i < h_frontier_count; i++)
-    h_bitflags[h_frontier_tmp[i]] |= kUnwrapped;
-    printf("  [GPU] frontier seed count: %d / %d pixels\n", h_frontier_count, length);
-
-    /* H2D transfers — after CPU seeding so bitflags/soln are updated */
-    cudaMemcpy(dev->d_phase,    h_phase,    (size_t)length * sizeof(float),         cudaMemcpyHostToDevice);
-    cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev->d_soln,     h_soln,     (size_t)length * sizeof(float),         cudaMemcpyHostToDevice);
-    cudaMemcpy(dev->d_gradx,    h_gradx,    (size_t)length * sizeof(float),         cudaMemcpyHostToDevice);
-    cudaMemcpy(dev->d_grady,    h_grady,    (size_t)length * sizeof(float),         cudaMemcpyHostToDevice);
-    cudaMemcpy(dev->d_frontier_a, h_frontier_tmp,
-               (size_t)h_frontier_count * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev->d_frontier_count_a, &h_frontier_count, sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemset(dev->d_frontier_count_b, 0, sizeof(int));
-    free(h_frontier_tmp);
-
-    /* BFS ping-pong loop */
-    int  *d_in  = dev->d_frontier_a,  *d_out = dev->d_frontier_b;
-    int  *n_in  = dev->d_frontier_count_a, *n_out = dev->d_frontier_count_b;
-    int   h_n_in = h_frontier_count;
-    int   round  = 0;
-
-    while (h_n_in > 0) {
-        cudaMemset(n_out, 0, sizeof(int));
-
-        const int threads = STAGE3_BFS_THREADS;
-        const int blocks  = (h_n_in + threads - 1) / threads;
-        k_bfs_expand<<<blocks, threads>>>(
-            dev->d_phase, dev->d_bitflags, dev->d_soln,
-            dev->d_gradx, dev->d_grady,
-            d_in, h_n_in, d_out, n_out,
-            xsize, ysize);
-        if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_bfs_expand"); return;
-        }
-        cudaDeviceSynchronize();
-
-        /* swap ping-pong buffers */
-        int *tmp; tmp = d_in;  d_in  = d_out;  d_out = tmp;
-                  tmp = n_in;  n_in  = n_out;   n_out = tmp;
-        cudaMemcpy(&h_n_in, n_in, sizeof(int), cudaMemcpyDeviceToHost);
-        ++round;
-    }
-    printf("  [GPU] BFS unwrap: %d rounds\n", round);
-
-    /* AVOID-band fill */
-    {
-        dim3 block(STAGE3_AVOID_TILE_W, STAGE3_AVOID_TILE_H);
-        dim3 grid((xsize + STAGE3_AVOID_TILE_W - 1) / STAGE3_AVOID_TILE_W,
-                  (ysize + STAGE3_AVOID_TILE_H - 1) / STAGE3_AVOID_TILE_H);
-        k_avoid_fill<<<grid, block>>>(dev->d_phase, dev->d_bitflags, dev->d_soln,
-                                      xsize, ysize);
-        if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_avoid_fill"); return;
-        }
-        cudaDeviceSynchronize();
+    /* Correctness-first Stage 3. The previous GPU BFS used atomic claims, so
+       a pixel reached by two same-level parents could choose a nondeterministic
+       parent. This mirrors the CPU UnwrapAroundCutsFrontier order exactly while
+       Stage 2 is being debugged. */
+    int *list = (int*)malloc((size_t)2 * (size_t)(xsize + ysize) * sizeof(int));
+    if (!list) {
+        fprintf(stderr, "unwrap_cuda: Stage3 host frontier malloc failed\n");
+        return;
     }
 
-    /* D2H */
-    cudaMemcpy(h_soln,     dev->d_soln,     (size_t)length * sizeof(float),         cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    int num_pieces = 0;
+    int max_frontier = 0;
 
-    {
-        int truly_bad = 0, twopi_off = 0;
-        float twopi = 2.0f * 3.14159265f;
-        for (int k = 0; k < length; k++) {
-            if (!(h_bitflags[k] & kUnwrapped)) continue;
-            float diff = h_soln[k] - h_phase[k];
-            float mod = fmodf(fabsf(diff), twopi);
-            if (mod > 0.01f && mod < twopi - 0.01f)
-                truly_bad++;
-            else
-                twopi_off++;
+    for (int k = 0; k < length; k++) {
+        if (!(h_bitflags[k] & (kBranchCut | kBorder | kUnwrapped))) {
+            ++num_pieces;
+            h_soln[k] = h_phase[k];
+
+            int flag = 1;
+            int base_in = 0;
+            int base_out = xsize + ysize;
+            int top_in = base_in;
+            int top_out = base_out;
+
+            list[top_in++] = k;
+
+            while (flag) {
+                if (top_in - base_in > max_frontier)
+                    max_frontier = top_in - base_in;
+
+                for (int l = base_in; l < top_in; l++) {
+                    const int kk = list[l];
+                    const int x = kk % xsize;
+                    const int y = kk / xsize;
+
+                    h_bitflags[kk] |= kUnwrapped;
+                    const float value = h_soln[kk];
+
+                    int index;
+
+                    index = kk - 1;
+                    if (x - 1 >= 0 && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
+                        h_bitflags[index] |= kUnwrapped;
+                        h_soln[index] = value + h_gradx[index];
+                        list[top_out++] = index;
+                    }
+
+                    index = kk + 1;
+                    if (x + 1 < xsize && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
+                        h_bitflags[index] |= kUnwrapped;
+                        h_soln[index] = value - h_gradx[kk];
+                        list[top_out++] = index;
+                    }
+
+                    index = kk - xsize;
+                    if (y - 1 >= 0 && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
+                        h_bitflags[index] |= kUnwrapped;
+                        h_soln[index] = value + h_grady[index];
+                        list[top_out++] = index;
+                    }
+
+                    index = kk + xsize;
+                    if (y + 1 < ysize && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
+                        h_bitflags[index] |= kUnwrapped;
+                        h_soln[index] = value - h_grady[kk];
+                        list[top_out++] = index;
+                    }
+                }
+
+                if (base_out == top_out) {
+                    flag = 0;
+                } else {
+                    int tmp;
+                    tmp = base_in;  base_in = base_out;  base_out = tmp;
+                    tmp = top_in;   top_in = top_out;    top_out = tmp;
+                    top_out = base_out;
+                }
+            }
         }
-        printf("  [GPU] truly_bad=%d  twopi_multiple_off=%d\n", truly_bad, twopi_off);
     }
+
+    for (int j = 1; j < ysize; j++) {
+        for (int i = 1; i < xsize; i++) {
+            const int k = j * xsize + i;
+            if (h_bitflags[k] & (kBranchCut | kBorder)) {
+                if (!(h_bitflags[k - 1] & (kBranchCut | kBorder))) {
+                    h_soln[k] = h_soln[k - 1] + host_gradient(h_phase[k], h_phase[k - 1]);
+                } else if (!(h_bitflags[k - xsize] & (kBranchCut | kBorder))) {
+                    h_soln[k] = h_soln[k - xsize] + host_gradient(h_phase[k], h_phase[k - xsize]);
+                }
+            }
+        }
+    }
+
+    printf("  [GPU] Stage3 correctness fallback: CPU-equivalent frontier, pieces=%d, max_frontier=%d\n",
+           num_pieces, max_frontier);
+
+    free(list);
 }
