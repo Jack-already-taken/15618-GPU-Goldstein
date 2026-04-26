@@ -376,6 +376,102 @@ __global__ void k_rasterize_cuts(const int *__restrict__ d_pairs,
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/*  Stage 2 verification: check residue/cut consistency on device           */
+/* ------------------------------------------------------------------------- */
+/* stats layout:
+ *   [0] total residue pixels
+ *   [1] residue pixels not marked as branch cut
+ *   [2] positive residues not marked as branch cut
+ *   [3] negative residues not marked as branch cut
+ *   [4] total branch-cut pixels
+ *   [5] branch-cut pixels touching image border
+ */
+__global__ void k_verify_stage2_branchcuts(const unsigned char *__restrict__ bitflags,
+                                           int length, int xsize, int ysize,
+                                           int *__restrict__ stats)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= length) return;
+
+    const unsigned char b = bitflags[k];
+    const bool is_pos = (b & kPosRes) != 0;
+    const bool is_neg = (b & kNegRes) != 0;
+    const bool is_res = is_pos || is_neg;
+    const bool is_cut = (b & kBranchCut) != 0;
+
+    if (is_res) {
+        atomicAdd(&stats[0], 1);
+        if (!is_cut) {
+            atomicAdd(&stats[1], 1);
+            if (is_pos) atomicAdd(&stats[2], 1);
+            if (is_neg) atomicAdd(&stats[3], 1);
+        }
+    }
+
+    if (is_cut) {
+        atomicAdd(&stats[4], 1);
+        const int x = k % xsize;
+        const int y = k / xsize;
+        if (x == 0 || x == xsize - 1 || y == 0 || y == ysize - 1)
+            atomicAdd(&stats[5], 1);
+    }
+}
+
+static void verify_stage2_branchcuts_device(const UnwrapCudaDeviceBufs *dev,
+                                            int length, int xsize, int ysize)
+{
+    if (!dev || !dev->d_bitflags || length <= 0 || xsize <= 0 || ysize <= 0)
+        return;
+
+    int *d_stats = nullptr;
+    int h_stats[6] = {0, 0, 0, 0, 0, 0};
+    cudaError_t e = cudaMalloc((void **)&d_stats, sizeof(h_stats));
+    if (e != cudaSuccess) {
+        cuda_fail(e, "cudaMalloc stage2 verify stats");
+        return;
+    }
+
+    cudaMemset(d_stats, 0, sizeof(h_stats));
+    const int threads = STAGE2_GROW_THREADS;
+    const int blocks = (length + threads - 1) / threads;
+    k_verify_stage2_branchcuts<<<blocks, threads>>>(dev->d_bitflags, length,
+                                                    xsize, ysize, d_stats);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        cuda_fail(e, "k_verify_stage2_branchcuts");
+        cudaFree(d_stats);
+        return;
+    }
+    e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        cuda_fail(e, "sync stage2 verify");
+        cudaFree(d_stats);
+        return;
+    }
+    e = cudaMemcpy(h_stats, d_stats, sizeof(h_stats), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        cuda_fail(e, "D2H stage2 verify stats");
+        cudaFree(d_stats);
+        return;
+    }
+    cudaFree(d_stats);
+
+    const double miss_pct = h_stats[0] ? 100.0 * (double)h_stats[1] / (double)h_stats[0] : 0.0;
+    const double border_pct = h_stats[4] ? 100.0 * (double)h_stats[5] / (double)h_stats[4] : 0.0;
+
+    printf("  [GPU][Stage2 verify] residues=%d, residue_not_cut=%d (%.2f%%), "
+           "pos_not_cut=%d, neg_not_cut=%d\n",
+           h_stats[0], h_stats[1], miss_pct, h_stats[2], h_stats[3]);
+    printf("  [GPU][Stage2 verify] branch_cut_pixels=%d, border_cut_pixels=%d (%.2f%% of cuts)\n",
+           h_stats[4], h_stats[5], border_pct);
+
+    if (h_stats[1] > 0) {
+        printf("  [GPU][Stage2 verify] WARNING: some residues are not on branch cuts; "
+               "Stage 3 may unwrap through residue cells.\n");
+    }
+}
+
 
 // __global__ void k_bfs_expand(const float        *phase,
 //                               unsigned char      *bitflags,
@@ -823,6 +919,9 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
         cuda_fail(e, "sync after stage 2"); return;
     }
+
+    /* ---- Stage 2 diagnostics: verify that residues are covered by cuts. -- */
+    verify_stage2_branchcuts_device(dev, length, xsize, ysize);
 
     /* ---- D2H bitflags ---------------------------------------------------- */
     if ((e = cudaMemcpy(h_bitflags, dev->d_bitflags, length,
