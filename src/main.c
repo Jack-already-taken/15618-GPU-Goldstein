@@ -1366,11 +1366,11 @@ static void run_unwrap_kernel_cuda(
     /* Stage 2: residue matching / branch cuts on the GPU. */
     if (have_device) {
         ta = clock();
-        unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
-                                            out->num_residues, ctx->xsize, ctx->ysize,
-                                            ctx->length);
-        // GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
-        //                            ctx->xsize, ctx->ysize);
+        // unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
+        //                                     out->num_residues, ctx->xsize, ctx->ysize,
+        //                                     ctx->length);
+        GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
+                                   ctx->xsize, ctx->ysize);
         tb = clock();
         out->ms_branch_cuts = timediff(ta, tb);
     } else {
