@@ -107,6 +107,13 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #define STAGE3_AVOID_TILE_H 16
 #endif
 
+static int cuda_fail(cudaError_t err, const char *where)
+{
+    if (err == cudaSuccess) return 0;
+    fprintf(stderr, "CUDA error at %s: %s\n", where, cudaGetErrorString(err));
+    return (int)err;
+}
+
 __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
                                     int xsize, int ysize, int *d_num_res)
 {
