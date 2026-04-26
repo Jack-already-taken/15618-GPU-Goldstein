@@ -113,11 +113,39 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #endif
 
 #ifndef STAGE2_MATCH_WINDOW
-#define STAGE2_MATCH_WINDOW 256
+/* 0 = original full-scan nearest-opposite-residue matching.
+   >0 = approximate bounded-window matching (faster but topology-changing). */
+#define STAGE2_MATCH_WINDOW 0
+#endif
+
+#ifndef STAGE2_USE_FIXED_BINS
+/* 1 = fixed-size spatial binning for Stage 2 majority-residue lookup.
+   This avoids O(N_min*N_maj) global scans. Each bin has a fixed capacity,
+   so overflowed residues are dropped from the bin lookup and counted. */
+#define STAGE2_USE_FIXED_BINS 1
+#endif
+#ifndef STAGE2_BIN_GRID_X
+#define STAGE2_BIN_GRID_X 128
+#endif
+#ifndef STAGE2_BIN_GRID_Y
+#define STAGE2_BIN_GRID_Y 128
+#endif
+#ifndef STAGE2_BIN_CAP
+#define STAGE2_BIN_CAP 32
+#endif
+#ifndef STAGE2_BIN_SEARCH_RADIUS
+#define STAGE2_BIN_SEARCH_RADIUS 2
+#endif
+#ifndef STAGE2_BIN_FALLBACK_FULL_SCAN
+/* If local bins have no candidate, fall back to the old full scan for that
+   residue. Set to 0 for maximum speed, 1 for safer matching. */
+#define STAGE2_BIN_FALLBACK_FULL_SCAN 0
 #endif
 
 #ifndef STAGE3_FAST_GPU_BFS
-#define STAGE3_FAST_GPU_BFS 1
+/* 0 = exact CPU-order frontier fallback.
+   1 = experimental fast GPU BFS. */
+#define STAGE3_FAST_GPU_BFS 0
 #endif
 
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
@@ -376,6 +404,114 @@ __global__ void k_match_residues(const int *__restrict__ d_minority,
         d_pairs[2 * min_idx    ] = my_enc;
         d_pairs[2 * min_idx + 1] = best_enc;
     }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/*  Stage 2 fixed-bin spatial lookup                                         */
+/* ------------------------------------------------------------------------- */
+__device__ __forceinline__ int stage2_bin_id_from_xy(int i, int j, int xsize, int ysize)
+{
+    int bx = (int)(((long long)i * STAGE2_BIN_GRID_X) / max(xsize, 1));
+    int by = (int)(((long long)j * STAGE2_BIN_GRID_Y) / max(ysize, 1));
+    if (bx < 0) bx = 0;
+    if (by < 0) by = 0;
+    if (bx >= STAGE2_BIN_GRID_X) bx = STAGE2_BIN_GRID_X - 1;
+    if (by >= STAGE2_BIN_GRID_Y) by = STAGE2_BIN_GRID_Y - 1;
+    return by * STAGE2_BIN_GRID_X + bx;
+}
+
+__global__ void k_bin_majority_residues(const int *__restrict__ d_majority,
+                                        int n_maj,
+                                        int *__restrict__ d_bin_counts,
+                                        int *__restrict__ d_bin_items,
+                                        int *__restrict__ d_overflow,
+                                        int xsize, int ysize)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_maj) return;
+
+    const int enc = d_majority[1 + t];
+    int i, j;
+    decode_ij(enc, i, j);
+    const int bid = stage2_bin_id_from_xy(i, j, xsize, ysize);
+    const int slot = atomicAdd(&d_bin_counts[bid], 1);
+    if (slot < STAGE2_BIN_CAP) {
+        d_bin_items[bid * STAGE2_BIN_CAP + slot] = enc;
+    } else {
+        atomicAdd(d_overflow, 1);
+    }
+}
+
+__global__ void k_match_residues_fixed_bins(const int *__restrict__ d_minority,
+                                            const int *__restrict__ d_majority,
+                                            int n_min, int n_maj,
+                                            const int *__restrict__ d_bin_counts,
+                                            const int *__restrict__ d_bin_items,
+                                            int *__restrict__ d_pairs,
+                                            int xsize, int ysize)
+{
+    const int min_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (min_idx >= n_min) return;
+
+    const int my_enc = d_minority[1 + min_idx];
+    int mi, mj;
+    decode_ij(my_enc, mi, mj);
+
+    const int my_bid = stage2_bin_id_from_xy(mi, mj, xsize, ysize);
+    const int my_bx = my_bid % STAGE2_BIN_GRID_X;
+    const int my_by = my_bid / STAGE2_BIN_GRID_X;
+
+    int best_d2 = INT_MAX;
+    int best_enc = -1;
+
+    for (int dy = -STAGE2_BIN_SEARCH_RADIUS; dy <= STAGE2_BIN_SEARCH_RADIUS; ++dy) {
+        const int by = my_by + dy;
+        if ((unsigned)by >= (unsigned)STAGE2_BIN_GRID_Y) continue;
+        for (int dx = -STAGE2_BIN_SEARCH_RADIUS; dx <= STAGE2_BIN_SEARCH_RADIUS; ++dx) {
+            const int bx = my_bx + dx;
+            if ((unsigned)bx >= (unsigned)STAGE2_BIN_GRID_X) continue;
+            const int bid = by * STAGE2_BIN_GRID_X + bx;
+            int count = d_bin_counts[bid];
+            if (count > STAGE2_BIN_CAP) count = STAGE2_BIN_CAP;
+
+            for (int k = 0; k < count; ++k) {
+                const int enc = d_bin_items[bid * STAGE2_BIN_CAP + k];
+                int pi, pj;
+                decode_ij(enc, pi, pj);
+                const int di = pi - mi;
+                const int dj = pj - mj;
+                const int d2 = di * di + dj * dj;
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best_enc = enc;
+                }
+            }
+        }
+    }
+
+#if STAGE2_BIN_FALLBACK_FULL_SCAN
+    if (best_enc < 0) {
+        for (int m = 0; m < n_maj; ++m) {
+            const int enc = d_majority[1 + m];
+            int pi, pj;
+            decode_ij(enc, pi, pj);
+            const int di = pi - mi;
+            const int dj = pj - mj;
+            const int d2 = di * di + dj * dj;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best_enc = enc;
+            }
+        }
+    }
+#endif
+
+    if (best_enc < 0)
+        best_enc = nearest_edge_enc(mi, mj, xsize, ysize);
+
+    d_pairs[2 * min_idx    ] = my_enc;
+    d_pairs[2 * min_idx + 1] = best_enc;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -989,23 +1125,101 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
                                             : dev->d_pos_residues;
 
     /* ---- Kernel 2: minority -> majority matching ------------------------- */
+    int *d_bin_counts = NULL;
+    int *d_bin_items = NULL;
+    int *d_bin_overflow = NULL;
+
+#if STAGE2_USE_FIXED_BINS
+    const int n_bins = STAGE2_BIN_GRID_X * STAGE2_BIN_GRID_Y;
+    cudaEventRecord(t0, 0);
+    e = cudaMalloc((void **)&d_bin_counts, (size_t)n_bins * sizeof(int));
+    if (e == cudaSuccess)
+        e = cudaMalloc((void **)&d_bin_items,
+                       (size_t)n_bins * (size_t)STAGE2_BIN_CAP * sizeof(int));
+    if (e == cudaSuccess)
+        e = cudaMalloc((void **)&d_bin_overflow, sizeof(int));
+    if (e == cudaSuccess)
+        e = cudaMemsetAsync(d_bin_counts, 0, (size_t)n_bins * sizeof(int));
+    if (e == cudaSuccess)
+        e = cudaMemsetAsync(d_bin_overflow, 0, sizeof(int));
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 fixed-bin alloc/reset", t0, t1);
+    if (e != cudaSuccess) {
+        cuda_fail(e, "Stage2 fixed-bin alloc/reset");
+        cudaFree(d_bin_counts); cudaFree(d_bin_items); cudaFree(d_bin_overflow);
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
+    if (n_maj > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks = (n_maj + threads - 1) / threads;
+        cudaEventRecord(t0, 0);
+        k_bin_majority_residues<<<blocks, threads>>>(d_maj, n_maj,
+                                                     d_bin_counts, d_bin_items,
+                                                     d_bin_overflow,
+                                                     xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_bin_majority", t0, t1);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_bin_majority_residues");
+            cudaFree(d_bin_counts); cudaFree(d_bin_items); cudaFree(d_bin_overflow);
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
+        }
+    }
+
+    int h_bin_overflow = 0;
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(&h_bin_overflow, d_bin_overflow, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 D2H bin overflow", t0, t1);
+    if (e == cudaSuccess) {
+        printf("  [GPU][Stage2] fixed bins: grid=%dx%d cap=%d search_radius=%d overflow=%d\n",
+               STAGE2_BIN_GRID_X, STAGE2_BIN_GRID_Y, STAGE2_BIN_CAP,
+               STAGE2_BIN_SEARCH_RADIUS, h_bin_overflow);
+    } else {
+        cuda_fail(e, "D2H bin overflow");
+    }
+#endif
+
     if (n_min > 0) {
         const int threads = STAGE2_GROW_THREADS;
         const int blocks  = (n_min + threads - 1) / threads;
 
         cudaEventRecord(t0, 0);
+#if STAGE2_USE_FIXED_BINS
+        k_match_residues_fixed_bins<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
+                                                         d_bin_counts, d_bin_items,
+                                                         dev->d_pairs, xsize, ysize);
+#else
         k_match_residues<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
                                               dev->d_pairs, xsize, ysize);
+#endif
         cudaEventRecord(t1, 0);
         cudaEventSynchronize(t1);
+#if STAGE2_USE_FIXED_BINS
+        print_cuda_interval("Stage2 k_match_fixed_bins", t0, t1);
+#else
         print_cuda_interval("Stage2 k_match_residues", t0, t1);
+#endif
 
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_match_residues");
+            cuda_fail(e, "Stage2 matching");
+            cudaFree(d_bin_counts); cudaFree(d_bin_items); cudaFree(d_bin_overflow);
             cudaEventDestroy(t0); cudaEventDestroy(t1);
             return;
         }
     }
+
+#if STAGE2_USE_FIXED_BINS
+    cudaFree(d_bin_counts);
+    cudaFree(d_bin_items);
+    cudaFree(d_bin_overflow);
+#endif
 
     /* ---- Kernel 3: leftover majority -> edge ----------------------------- */
     const int n_leftover = n_maj - n_min;
@@ -1295,6 +1509,10 @@ extern "C" void unwrap_cuda_launch_unwrapping(
 
     /* Exact CPU fallback.  Compile with -DSTAGE3_FAST_GPU_BFS=0 to force this
        path when exact CPU-order replay is needed for debugging. */
+    printf("  [GPU][Stage3 timing] begin (exact CPU-order fallback)\n");
+    clock_t s3_exact_total_t0 = clock();
+    clock_t s3_exact_t0 = clock();
+
     int *list = (int*)malloc((size_t)2 * (size_t)(xsize + ysize) * sizeof(int));
     if (!list) {
         fprintf(stderr, "unwrap_cuda: Stage3 host frontier malloc failed\n");
@@ -1367,6 +1585,12 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         }
     }
 
+    {
+        double ms = 1000.0 * (double)(clock() - s3_exact_t0) / (double)CLOCKS_PER_SEC;
+        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 exact frontier unwrap", ms);
+    }
+    s3_exact_t0 = clock();
+
     for (int j = 1; j < ysize; j++) {
         for (int i = 1; i < xsize; i++) {
             const int k = j * xsize + i;
@@ -1377,6 +1601,13 @@ extern "C" void unwrap_cuda_launch_unwrapping(
                     h_soln[k] = h_soln[k - xsize] + host_gradient(h_phase[k], h_phase[k - xsize]);
             }
         }
+    }
+
+    {
+        double ms = 1000.0 * (double)(clock() - s3_exact_t0) / (double)CLOCKS_PER_SEC;
+        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 exact avoid-fill", ms);
+        double total_ms = 1000.0 * (double)(clock() - s3_exact_total_t0) / (double)CLOCKS_PER_SEC;
+        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 exact total", total_ms);
     }
 
     printf("  [GPU] Stage3 exact CPU fallback: pieces=%d, max_frontier=%d\n",
