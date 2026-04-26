@@ -1159,6 +1159,78 @@ static double compute_rms(const float *result, const float *truth, int length)
     return sqrt(sum_sq / length);
 }
 
+static double wrap_to_pi_double(double x)
+{
+    while (x > M_PI)
+        x -= 2.0 * M_PI;
+    while (x < -M_PI)
+        x += 2.0 * M_PI;
+    return x;
+}
+
+/* Relaxed CPU-vs-GPU phase comparison.
+ * Useful when CPU and GPU use different valid branch-cut topologies.
+ * global_offset_rmse: allows one global constant offset.
+ * wrapped_diff_rmse: additionally treats local 2*pi offsets as equivalent.
+ * wrapped_grad_rmse: compares local wrapped gradients, which is usually the
+ * strongest topology-agnostic metric for unwrapped phase quality.
+ */
+static void soln_relaxed_rms_stats(const float *gpu,
+                                   const float *cpu,
+                                   int xsize,
+                                   int ysize,
+                                   double *global_offset_rmse,
+                                   double *wrapped_diff_rmse,
+                                   double *wrapped_grad_rmse,
+                                   int *wrapped_bad_count,
+                                   double wrapped_tol)
+{
+    int k, x, y;
+    int length = xsize * ysize;
+    double offset = 0.0;
+    double ss_global = 0.0, ss_wrap = 0.0, ss_grad = 0.0;
+    int grad_n = 0, bad = 0;
+
+    for (k = 0; k < length; k++)
+        offset += (double)gpu[k] - (double)cpu[k];
+    offset /= (double)length;
+
+    for (k = 0; k < length; k++) {
+        double d = ((double)gpu[k] - (double)cpu[k]) - offset;
+        double dw = wrap_to_pi_double(d);
+        ss_global += d * d;
+        ss_wrap += dw * dw;
+        if (fabs(dw) > wrapped_tol)
+            ++bad;
+    }
+
+    for (y = 0; y < ysize; y++) {
+        for (x = 0; x < xsize - 1; x++) {
+            k = y * xsize + x;
+            double gg = Gradient(gpu[k + 1], gpu[k]);
+            double cg = Gradient(cpu[k + 1], cpu[k]);
+            double d = wrap_to_pi_double(gg - cg);
+            ss_grad += d * d;
+            ++grad_n;
+        }
+    }
+    for (y = 0; y < ysize - 1; y++) {
+        for (x = 0; x < xsize; x++) {
+            k = y * xsize + x;
+            double gg = Gradient(gpu[k + xsize], gpu[k]);
+            double cg = Gradient(cpu[k + xsize], cpu[k]);
+            double d = wrap_to_pi_double(gg - cg);
+            ss_grad += d * d;
+            ++grad_n;
+        }
+    }
+
+    *global_offset_rmse = sqrt(ss_global / (double)length);
+    *wrapped_diff_rmse = sqrt(ss_wrap / (double)length);
+    *wrapped_grad_rmse = grad_n ? sqrt(ss_grad / (double)grad_n) : 0.0;
+    *wrapped_bad_count = bad;
+}
+
 
 /* Bitwise compare for parallel-vs-serial verification (masked flags only). */
 static int count_flag_mismatch(const unsigned char *a, const unsigned char *b,
@@ -1540,6 +1612,9 @@ double goldstein_phase_unwrapping(const char *input_path,
     int            branch_cuda = 0, branch_cpu = 0;
     int            border_cuda = 0, border_cpu = 0;
     double         soln_max_abs = 0.0, soln_max_abs_gold = 0.0;
+    double         relaxed_global_rmse = 0.0, relaxed_wrapped_rmse = 0.0;
+    double         relaxed_grad_rmse = 0.0;
+    int            relaxed_wrapped_bad = 0;
     unsigned char *bf_res_ser = NULL, *bf_brc_ser = NULL, *bf_brc_1t = NULL;
     unsigned char *bf_preunwrap = NULL, *bf_unwrap2 = NULL, *bf_gold = NULL;
     unsigned char *snap_after_res = NULL;
@@ -1785,6 +1860,12 @@ double goldstein_phase_unwrapping(const char *input_path,
                                          grady, gradx, list, length, 0);
                 soln_diff_stats(soln, soln_gold, length,
                                 &soln_max_abs_gold, &n_soln_bad_gold, 1e-5f);
+                soln_relaxed_rms_stats(soln, soln_gold, xsize, ysize,
+                                       &relaxed_global_rmse,
+                                       &relaxed_wrapped_rmse,
+                                       &relaxed_grad_rmse,
+                                       &relaxed_wrapped_bad,
+                                       0.10);
             } else {
                 fprintf(stderr,
                         "verify_serial: malloc failed (gold reference buffers)\n");
@@ -1816,6 +1897,9 @@ double goldstein_phase_unwrapping(const char *input_path,
                "(max |Delta| = %.6g, cells > 1e-5: %d)\n",
                n_soln_bad_gold ? "CHECK" : "PASS",
                soln_max_abs_gold, n_soln_bad_gold);
+        printf("  Relaxed RMS vs CPU serial output         : global=%.6g rad, wrapped=%.6g rad, wrapped-grad=%.6g rad, |wrapped Delta|>0.1: %d\n",
+               relaxed_global_rmse, relaxed_wrapped_rmse,
+               relaxed_grad_rmse, relaxed_wrapped_bad);
 
         free(bf_brc_ser);
         bf_brc_ser = NULL;
