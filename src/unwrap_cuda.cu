@@ -151,7 +151,7 @@ __global__ void k_init_seeds(const float        *phase,
  * One thread per pixel in the current frontier (d_in / n_in).
  * Unwrapped neighbors are pushed into d_out via atomicAdd on *n_out.
  * ----------------------------------------------------------------------- */
-__global__ void k_bfs_expand(const float        *phase,
+// __global__ void k_bfs_expand(const float        *phase,
 //                               unsigned char      *bitflags,
 //                               float              *soln,
 //                               const float        *gradx,
