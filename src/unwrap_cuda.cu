@@ -17,6 +17,13 @@ constexpr unsigned char kUnwrapped  = 0x40;
 enum : unsigned char { kPosRes = 0x01, kNegRes = 0x02, kBorder = 0x20, kBranchCut = 0x10 };
 constexpr unsigned char kAvoid = kBranchCut | kBorder;
 
+static int cuda_fail(cudaError_t err, const char *where)
+{
+    if (err == cudaSuccess) return 0;
+    fprintf(stderr, "CUDA error at %s: %s\n", where, cudaGetErrorString(err));
+    return (int)err;
+}
+
 __device__ __forceinline__ float device_gradient(float p1, float p2)
 {
     float r = p1 - p2;
@@ -106,13 +113,6 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #ifndef STAGE3_AVOID_TILE_H
 #define STAGE3_AVOID_TILE_H 16
 #endif
-
-static int cuda_fail(cudaError_t err, const char *where)
-{
-    if (err == cudaSuccess) return 0;
-    fprintf(stderr, "CUDA error at %s: %s\n", where, cudaGetErrorString(err));
-    return (int)err;
-}
 
 __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
                                     int xsize, int ysize, int *d_num_res)
