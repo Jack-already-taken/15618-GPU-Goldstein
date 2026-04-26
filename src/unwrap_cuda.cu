@@ -72,10 +72,10 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
  * final AVOID-band fill pass.
  * ----------------------------------------------------------------------- */
 #ifndef STAGE1_RESIDUE_TILE_W
-#define STAGE1_RESIDUE_TILE_W 32
+#define STAGE1_RESIDUE_TILE_W 16
 #endif
 #ifndef STAGE1_RESIDUE_TILE_H
-#define STAGE1_RESIDUE_TILE_H 32
+#define STAGE1_RESIDUE_TILE_H 16
 #endif
 
 #ifndef STAGE2_PACK_THREADS
@@ -389,6 +389,125 @@ __global__ void k_goldstein_morton_growth(unsigned char *bitflags,
         int bx, by;
         nearest_border(active_x[best_a], active_y[best_a], xsize, ysize, &bx, &by);
         d_place_cut(bitflags, active_x[best_a], active_y[best_a], bx, by, xsize, ysize);
+    }
+}
+
+
+/* Correctness-first Stage 2 kernel.
+ *
+ * The previous parallel one-thread-per-seed growth can degenerate into every
+ * residue claiming itself before any cluster can absorb neighbors.  Then most
+ * clusters remain non-neutral and the fallback connects them to the border,
+ * producing the star-like branch-cut image.  This serial GPU kernel preserves
+ * the important Goldstein invariant: one cluster is grown to neutral charge
+ * before the next seed is allowed to start.
+ */
+__global__ void k_goldstein_morton_growth_ordered(unsigned char *bitflags,
+                                                  const int *packed_sorted,
+                                                  int *claimed,
+                                                  int nres,
+                                                  int max_cut_len,
+                                                  int xsize,
+                                                  int ysize)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    constexpr int MAX_ACTIVE = STAGE2_CLUSTER_MAX_ACTIVE;
+
+    for (int seed_ord = 0; seed_ord < nres; ++seed_ord) {
+        if (claimed[seed_ord] != 0) continue;
+
+        const int seed_pack = packed_sorted[seed_ord];
+        const int seed_idx = unpack_idx(seed_pack);
+        const int seed_charge = unpack_charge(seed_pack);
+
+        const int cluster_id = seed_ord + 1;
+        claimed[seed_ord] = cluster_id;
+
+        int active_x[MAX_ACTIVE];
+        int active_y[MAX_ACTIVE];
+        int active_n = 1;
+        active_x[0] = seed_idx % xsize;
+        active_y[0] = seed_idx / xsize;
+        int charge = seed_charge;
+
+        /* CPU Goldstein uses expanding odd boxes up to 2*MaxCutLen.  Here we
+           use squared Euclidean distance around every active residue, which is
+           not bit-identical but prevents premature border fallback and supports
+           multi-residue clusters. */
+        for (int radius = 1;
+             charge != 0 && radius <= max_cut_len && active_n < MAX_ACTIVE;
+             ++radius) {
+
+            bool absorbed_this_radius = true;
+            while (charge != 0 && absorbed_this_radius && active_n < MAX_ACTIVE) {
+                absorbed_this_radius = false;
+                int best_ord = -1;
+                int best_parent = 0;
+                int best_idx = -1;
+                int best_charge = 0;
+                int best_dist2 = INT_MAX;
+                const int r2 = radius * radius;
+
+                for (int ord = 0; ord < nres; ++ord) {
+                    if (claimed[ord] != 0) continue;
+                    const int p = packed_sorted[ord];
+                    const int idx = unpack_idx(p);
+                    const int cx = idx % xsize;
+                    const int cy = idx / xsize;
+
+                    int parent = 0;
+                    int local_best = INT_MAX;
+                    for (int a = 0; a < active_n; ++a) {
+                        const int dx = cx - active_x[a];
+                        const int dy = cy - active_y[a];
+                        const int d2 = dx * dx + dy * dy;
+                        if (d2 < local_best) {
+                            local_best = d2;
+                            parent = a;
+                        }
+                    }
+
+                    if (local_best <= r2 && local_best < best_dist2) {
+                        best_dist2 = local_best;
+                        best_ord = ord;
+                        best_parent = parent;
+                        best_idx = idx;
+                        best_charge = unpack_charge(p);
+                    }
+                }
+
+                if (best_ord >= 0) {
+                    claimed[best_ord] = cluster_id;
+                    const int bx = best_idx % xsize;
+                    const int by = best_idx / xsize;
+                    d_place_cut(bitflags, bx, by,
+                                active_x[best_parent], active_y[best_parent],
+                                xsize, ysize);
+                    active_x[active_n] = bx;
+                    active_y[active_n] = by;
+                    ++active_n;
+                    charge += best_charge;
+                    absorbed_this_radius = true;
+                }
+            }
+        }
+
+        if (charge != 0) {
+            int best_a = 0;
+            int best_d = INT_MAX;
+            for (int a = 0; a < active_n; ++a) {
+                const int x = active_x[a], y = active_y[a];
+                int d = x;
+                int t = xsize - 1 - x; if (t < d) d = t;
+                t = y; if (t < d) d = t;
+                t = ysize - 1 - y; if (t < d) d = t;
+                if (d < best_d) { best_d = d; best_a = a; }
+            }
+            int bx, by;
+            nearest_border(active_x[best_a], active_y[best_a], xsize, ysize, &bx, &by);
+            d_place_cut(bitflags, active_x[best_a], active_y[best_a], bx, by, xsize, ysize);
+        }
     }
 }
 
@@ -822,10 +941,11 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     if ((e = cudaMemset(d_claimed, 0, (size_t)h_count * sizeof(int))) != cudaSuccess) goto fail;
 
     {
-        const int threads = STAGE2_GROW_THREADS;
-        const int blocks = (h_count + threads - 1) / threads;
-        k_goldstein_morton_growth<<<blocks, threads>>>(dev->d_bitflags, d_packed, d_claimed,
-                                                       h_count, max_cut_len, xsize, ysize);
+        /* Correctness-first ordered growth: one cluster is completed before
+           the next seed starts.  This avoids the all-residues-to-border race
+           caused by launching one parallel seed per residue. */
+        k_goldstein_morton_growth_ordered<<<1, 1>>>(dev->d_bitflags, d_packed, d_claimed,
+                                                    h_count, max_cut_len, xsize, ysize);
         if ((e = cudaGetLastError()) != cudaSuccess) goto fail;
         if ((e = cudaDeviceSynchronize()) != cudaSuccess) goto fail;
     }
