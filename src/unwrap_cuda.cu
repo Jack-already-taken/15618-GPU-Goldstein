@@ -641,14 +641,6 @@ __global__ void k_avoid_fill(const float   *phase,
 
 __global__ void k_noop(void) {}
 
-static int cuda_fail(cudaError_t e, const char *msg)
-{
-    if (e == cudaSuccess)
-        return 0;
-    fprintf(stderr, "unwrap_cuda: %s: %s\n", msg, cudaGetErrorString(e));
-    return (int)e;
-}
-
 static dim3 residue_grid(int xsize, int ysize)
 {
     constexpr int bx = STAGE1_RESIDUE_TILE_W;
