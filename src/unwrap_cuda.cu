@@ -3,6 +3,8 @@
 #include <climits>
 #include <cmath>
 #include <map>
+#include <unordered_map>
+#include <cstdint>
 #include <utility>
 #include <vector>
 #include <queue>
@@ -876,11 +878,12 @@ __global__ void k_unwrap_frontier_tiles_baseline(
 /*           pixel NaN or rolls a second component into the first one's     */
 /*           offset.                                                         */
 /*                                                                           */
-/*  Step 2 (solve_tile_offsets_from_seams): the host builds a graph whose    */
-/*           nodes are (tile_id, local_component_id) pairs and whose edges   */
-/*           are seam-pixel votes for the integer 2*pi offset between two    */
-/*           specific components on opposite sides of a tile boundary. BFS   */
-/*           per connected subgraph yields a per-(tile, component) offset.   */
+/*  Step 2: collect seam votes on the GPU, then solve only the compact       */
+/*           seam graph on the host. Nodes are (tile_id, local_component_id) */
+/*           slots that actually touch a seam; edges are seam-pixel votes     */
+/*           for the integer 2*pi offset between two specific components on   */
+/*           opposite sides of a tile boundary. BFS per connected subgraph    */
+/*           yields a per-(tile, component) offset.                           */
 /*                                                                           */
 /*  Step 3 (k_apply_tile_offsets): each pixel reads its component id and    */
 /*           adds offset_lut[tile_id, comp] * 2*pi to the local solution.   */
@@ -1047,134 +1050,157 @@ __global__ void k_apply_tile_offsets(float *__restrict__ soln,
                * (float)TWOPI;
 }
 
-static void solve_tile_offsets_from_seams(const float *h_phase,
-                                          const unsigned char *h_bitflags,
-                                          const float *h_local_soln,
-                                          const int *h_tile_component,
-                                          int xsize, int ysize,
+
+struct SeamVote {
+    int slot_a;
+    int slot_b;
+    int delta_k;
+    int weight;
+};
+
+__global__ void k_collect_seam_votes(const float *__restrict__ phase,
+                                     const unsigned char *__restrict__ bitflags,
+                                     const float *__restrict__ local_soln,
+                                     const int *__restrict__ tile_component,
+                                     SeamVote *__restrict__ seam_votes,
+                                     int *__restrict__ vote_count,
+                                     int xsize, int ysize, int tiles_x)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= xsize || j >= ysize)
+        return;
+
+    const int ia = j * xsize + i;
+
+    if (i + 1 < xsize) {
+        const int tile_x_a = i / UNWRAP_TILE_W;
+        const int tile_x_b = (i + 1) / UNWRAP_TILE_W;
+        if (tile_x_a != tile_x_b) {
+            const int ib = ia + 1;
+            if (is_valid_unwrap_pixel(bitflags, ia) &&
+                is_valid_unwrap_pixel(bitflags, ib)) {
+                const int ca = tile_component[ia];
+                const int cb = tile_component[ib];
+                const float ua = local_soln[ia];
+                const float ub = local_soln[ib];
+                if (ca >= 0 && cb >= 0 && isfinite(ua) && isfinite(ub)) {
+                    const int tile_y = j / UNWRAP_TILE_H;
+                    const int tile_a = tile_y * tiles_x + tile_x_a;
+                    const int tile_b = tile_y * tiles_x + tile_x_b;
+                    const float grad = device_gradient(phase[ib], phase[ia]);
+                    const float kf = (ua + grad - ub) / (float)TWOPI;
+                    const int out = atomicAdd(vote_count, 1);
+                    seam_votes[out].slot_a = tile_a * UNWRAP_TILE_PIXELS + ca;
+                    seam_votes[out].slot_b = tile_b * UNWRAP_TILE_PIXELS + cb;
+                    seam_votes[out].delta_k = __float2int_rn(kf);
+                    seam_votes[out].weight = 1;
+                }
+            }
+        }
+    }
+
+    if (j + 1 < ysize) {
+        const int tile_y_a = j / UNWRAP_TILE_H;
+        const int tile_y_b = (j + 1) / UNWRAP_TILE_H;
+        if (tile_y_a != tile_y_b) {
+            const int ib = ia + xsize;
+            if (is_valid_unwrap_pixel(bitflags, ia) &&
+                is_valid_unwrap_pixel(bitflags, ib)) {
+                const int ca = tile_component[ia];
+                const int cb = tile_component[ib];
+                const float ua = local_soln[ia];
+                const float ub = local_soln[ib];
+                if (ca >= 0 && cb >= 0 && isfinite(ua) && isfinite(ub)) {
+                    const int tile_x = i / UNWRAP_TILE_W;
+                    const int tile_a = tile_y_a * tiles_x + tile_x;
+                    const int tile_b = tile_y_b * tiles_x + tile_x;
+                    const float grad = device_gradient(phase[ib], phase[ia]);
+                    const float kf = (ua + grad - ub) / (float)TWOPI;
+                    const int out = atomicAdd(vote_count, 1);
+                    seam_votes[out].slot_a = tile_a * UNWRAP_TILE_PIXELS + ca;
+                    seam_votes[out].slot_b = tile_b * UNWRAP_TILE_PIXELS + cb;
+                    seam_votes[out].delta_k = __float2int_rn(kf);
+                    seam_votes[out].weight = 1;
+                }
+            }
+        }
+    }
+}
+
+static inline std::uint64_t pack_edge_key(int a, int b)
+{
+    return (std::uint64_t)(std::uint32_t)a << 32
+         | (std::uint64_t)(std::uint32_t)b;
+}
+
+static void solve_slot_offsets_from_votes(const SeamVote *h_votes,
+                                          int vote_count,
+                                          int slot_count,
                                           std::vector<int> &offset_lut)
 {
-    const int tiles_x = div_up_int(xsize, UNWRAP_TILE_W);
-    const int tiles_y = div_up_int(ysize, UNWRAP_TILE_H);
-    const int tile_count = tiles_x * tiles_y;
+    struct EdgeAccum {
+        std::unordered_map<int, int> hist;
+        int total = 0;
+    };
+    struct Edge {
+        int to;
+        int delta_k;
+        int support;
+        int total;
+    };
 
-    /* Nodes: one per (tile, local_component). The slot table is direct-access
-     * keyed by tile_id * UNWRAP_TILE_PIXELS + comp, since comp is in [0,256). */
-    std::vector<int> node_id_of_slot((size_t)tile_count * UNWRAP_TILE_PIXELS, -1);
-    std::vector<std::pair<int, int>> key_of_node;
-    key_of_node.reserve((size_t)tile_count);
+    std::unordered_map<int, int> node_id_of_slot;
+    node_id_of_slot.reserve((size_t)vote_count * 2 + 1);
 
-    auto get_or_add_node = [&](int tile_id, int comp) -> int {
-        if (comp < 0)
-            return -1;
-        const size_t slot = (size_t)tile_id * UNWRAP_TILE_PIXELS + (size_t)comp;
-        int id = node_id_of_slot[slot];
-        if (id >= 0)
-            return id;
-        id = (int)key_of_node.size();
-        node_id_of_slot[slot] = id;
-        key_of_node.push_back({tile_id, comp});
+    std::vector<int> slot_of_node;
+    slot_of_node.reserve((size_t)vote_count * 2);
+
+    auto get_or_add_node = [&](int slot) -> int {
+        auto it = node_id_of_slot.find(slot);
+        if (it != node_id_of_slot.end())
+            return it->second;
+        const int id = (int)slot_of_node.size();
+        node_id_of_slot.emplace(slot, id);
+        slot_of_node.push_back(slot);
         return id;
     };
 
-    /* Materialize a node for every (tile, component) that actually owns a
-     * pixel. Without this, a tile that has signal but no usable seam edge
-     * (e.g. ringed by blocked tiles) would never get a 0 offset assigned. */
-    for (int j = 0; j < ysize; ++j) {
-        const int ty = j / UNWRAP_TILE_H;
-        for (int i = 0; i < xsize; ++i) {
-            const int idx = j * xsize + i;
-            const int comp = h_tile_component[idx];
-            if (comp < 0)
-                continue;
-            const int tx = i / UNWRAP_TILE_W;
-            const int tile_id = ty * tiles_x + tx;
-            get_or_add_node(tile_id, comp);
-        }
-    }
+    std::unordered_map<std::uint64_t, EdgeAccum> edge_map;
+    edge_map.reserve((size_t)vote_count * 2 + 1);
 
-    /* Per-edge seam voting. Rather than averaging all seam votes into one
-     * integer, keep a histogram of candidate k offsets and only accept a
-     * seam edge when one integer delta clearly dominates. This prevents a
-     * noisy / cut-adjacent seam from exporting the wrong 2*pi reference far
-     * away from the branch-cut neighborhood. */
-    struct EdgeAccum {
-        std::map<int, int> hist;
-        int count = 0;
-    };
-    std::map<std::pair<int, int>, EdgeAccum> edge_map;
-
-    auto accumulate_edge = [&](int node_a, int node_b, int k_ab) {
-        if (node_a < 0 || node_b < 0 || node_a == node_b)
-            return;
-        int a = node_a, b = node_b, k = k_ab;
-        if (a > b) { std::swap(a, b); k = -k; }
-        auto &e = edge_map[{a, b}];
-        e.hist[k] += 1;
-        e.count += 1;
-    };
-
-    auto vote_pair = [&](int ia, int ib, int tile_a, int tile_b) {
-        const int ca = h_tile_component[ia];
-        const int cb = h_tile_component[ib];
-        if (ca < 0 || cb < 0)
-            return;
-        const float ua = h_local_soln[ia];
-        const float ub = h_local_soln[ib];
-        if (!std::isfinite(ua) || !std::isfinite(ub))
-            return;
-        const float grad = host_wrap_diff(h_phase[ib], h_phase[ia]);
-        const float kf = (ua + grad - ub) / (float)TWOPI;
-        const int k = (int)llroundf(kf);
-        const int na = node_id_of_slot[(size_t)tile_a * UNWRAP_TILE_PIXELS + (size_t)ca];
-        const int nb = node_id_of_slot[(size_t)tile_b * UNWRAP_TILE_PIXELS + (size_t)cb];
-        accumulate_edge(na, nb, k);
-    };
-
-    /* Vertical seams. */
-    for (int ty = 0; ty < tiles_y; ++ty) {
-        const int y0 = ty * UNWRAP_TILE_H;
-        const int y1 = std::min(ysize, y0 + UNWRAP_TILE_H);
-        for (int tx = 0; tx + 1 < tiles_x; ++tx) {
-            const int ax = (tx + 1) * UNWRAP_TILE_W - 1;
-            const int bx = ax + 1;
-            if (bx >= xsize)
-                continue;
-            const int tile_a = ty * tiles_x + tx;
-            const int tile_b = ty * tiles_x + tx + 1;
-            for (int y = y0; y < y1; ++y)
-                vote_pair(y * xsize + ax, y * xsize + bx, tile_a, tile_b);
-        }
-    }
-
-    /* Horizontal seams. */
-    for (int ty = 0; ty + 1 < tiles_y; ++ty) {
-        const int ay = (ty + 1) * UNWRAP_TILE_H - 1;
-        const int by = ay + 1;
-        if (by >= ysize)
+    for (int i = 0; i < vote_count; ++i) {
+        int slot_a = h_votes[i].slot_a;
+        int slot_b = h_votes[i].slot_b;
+        int k = h_votes[i].delta_k;
+        if (slot_a < 0 || slot_b < 0 || slot_a == slot_b)
             continue;
-        for (int tx = 0; tx < tiles_x; ++tx) {
-            const int x0 = tx * UNWRAP_TILE_W;
-            const int x1 = std::min(xsize, x0 + UNWRAP_TILE_W);
-            const int tile_a = ty * tiles_x + tx;
-            const int tile_b = (ty + 1) * tiles_x + tx;
-            for (int x = x0; x < x1; ++x)
-                vote_pair(ay * xsize + x, by * xsize + x, tile_a, tile_b);
+
+        int a = get_or_add_node(slot_a);
+        int b = get_or_add_node(slot_b);
+        if (a == b)
+            continue;
+        if (a > b) {
+            std::swap(a, b);
+            k = -k;
         }
+
+        EdgeAccum &acc = edge_map[pack_edge_key(a, b)];
+        acc.hist[k] += 1;
+        acc.total += h_votes[i].weight;
     }
 
-    /* Collapse seam votes -> one integer delta per edge; build adjacency
-     * list. Keep only edges with a clear dominant vote. Ambiguous seams are
-     * dropped so they cannot impose a wrong global offset across many tiles. */
-    const int node_count = (int)key_of_node.size();
-    struct Edge { int to; int delta_k; int support; int total; };
+    const int node_count = (int)slot_of_node.size();
     std::vector<std::vector<Edge>> graph((size_t)node_count);
+
     constexpr int kMinSeamSupport = 2;
     constexpr double kMinSeamAgreement = 0.60;
+
     for (const auto &kv : edge_map) {
-        const int a = kv.first.first;
-        const int b = kv.first.second;
+        const int a = (int)(kv.first >> 32);
+        const int b = (int)(kv.first & 0xFFFFFFFFu);
         const EdgeAccum &acc = kv.second;
+
         int best_k = 0;
         int best_count = 0;
         for (const auto &vote : acc.hist) {
@@ -1183,30 +1209,28 @@ static void solve_tile_offsets_from_seams(const float *h_phase,
                 best_count = vote.second;
             }
         }
+
         if (best_count < kMinSeamSupport)
             continue;
-        const double agree = (double)best_count / (double)acc.count;
+        const double agree = (double)best_count / (double)acc.total;
         if (agree < kMinSeamAgreement)
             continue;
-        graph[a].push_back({b, best_k, best_count, acc.count});
-        graph[b].push_back({a, -best_k, best_count, acc.count});
+
+        graph[a].push_back({b, best_k, best_count, acc.total});
+        graph[b].push_back({a, -best_k, best_count, acc.total});
     }
 
-    /* Confidence-ordered BFS per connected subgraph: each isolated island gets
-     * its own k=0 origin, matching the C frontier's per-piece behavior. When
-     * an already-assigned node is revisited through a conflicting edge, keep
-     * the existing assignment and treat the seam as unreliable rather than
-     * letting one bad seam vote rewrite a large region's offset. */
-    std::vector<int> node_offsets((size_t)node_count, INT_MAX);
-    std::queue<int> q;
     for (int u = 0; u < node_count; ++u) {
         std::sort(graph[u].begin(), graph[u].end(),
-                  [](const Edge &a, const Edge &b) {
-                      if (a.support != b.support)
-                          return a.support > b.support;
-                      return a.total > b.total;
+                  [](const Edge &lhs, const Edge &rhs) {
+                      if (lhs.support != rhs.support)
+                          return lhs.support > rhs.support;
+                      return lhs.total > rhs.total;
                   });
     }
+
+    std::vector<int> node_offsets((size_t)node_count, INT_MAX);
+    std::queue<int> q;
     for (int seed = 0; seed < node_count; ++seed) {
         if (node_offsets[seed] != INT_MAX)
             continue;
@@ -1221,17 +1245,15 @@ static void solve_tile_offsets_from_seams(const float *h_phase,
                     node_offsets[e.to] = cand;
                     q.push(e.to);
                 }
-                /* else: conflicting seam vote -> ignore this edge */
             }
         }
     }
 
-    /* Emit the per-(tile, comp) offset LUT consumed by k_apply_tile_offsets. */
-    offset_lut.assign((size_t)tile_count * UNWRAP_TILE_PIXELS, 0);
+    offset_lut.assign((size_t)slot_count, 0);
     for (int n = 0; n < node_count; ++n) {
-        const int tid = key_of_node[n].first;
-        const int comp = key_of_node[n].second;
-        offset_lut[(size_t)tid * UNWRAP_TILE_PIXELS + (size_t)comp] = node_offsets[n];
+        const int slot = slot_of_node[n];
+        if (slot >= 0 && slot < slot_count && node_offsets[n] != INT_MAX)
+            offset_lut[(size_t)slot] = node_offsets[n];
     }
 }
 
@@ -1753,29 +1775,85 @@ extern "C" void unwrap_cuda_launch_unwrapping(float *h_phase, unsigned char *h_b
             return;
         }
 
-        std::vector<float> h_local_soln((size_t)length);
-        std::vector<int>   h_tile_component((size_t)length);
-        if ((e = cudaMemcpy(h_local_soln.data(), dev->d_soln,
-                            (size_t)length * sizeof(float),
-                            cudaMemcpyDeviceToHost)) != cudaSuccess) {
-            cuda_fail(e, "D2H local tile unwrap");
+        const int max_seam_votes =
+            ysize * std::max(0, tiles_x - 1) +
+            xsize * std::max(0, tiles_y - 1);
+
+        SeamVote *d_seam_votes = nullptr;
+        int *d_vote_count = nullptr;
+        int *d_offset_lut = nullptr;
+
+        if ((e = cudaMalloc((void **)&d_seam_votes,
+                            (size_t)std::max(1, max_seam_votes) * sizeof(SeamVote)))
+            != cudaSuccess) {
+            cuda_fail(e, "malloc seam_votes");
             cudaFree(d_tile_component);
             return;
         }
-        if ((e = cudaMemcpy(h_tile_component.data(), d_tile_component,
-                            (size_t)length * sizeof(int),
-                            cudaMemcpyDeviceToHost)) != cudaSuccess) {
-            cuda_fail(e, "D2H tile_component");
+        if ((e = cudaMalloc((void **)&d_vote_count, sizeof(int))) != cudaSuccess) {
+            cuda_fail(e, "malloc vote_count");
+            cudaFree(d_seam_votes);
             cudaFree(d_tile_component);
             return;
         }
+        if ((e = cudaMemset(d_vote_count, 0, sizeof(int))) != cudaSuccess) {
+            cuda_fail(e, "memset vote_count");
+            cudaFree(d_vote_count);
+            cudaFree(d_seam_votes);
+            cudaFree(d_tile_component);
+            return;
+        }
+
+        dim3 seam_block(16, 16);
+        dim3 seam_grid(div_up_int(xsize, 16), div_up_int(ysize, 16));
+        k_collect_seam_votes<<<seam_grid, seam_block>>>(
+            dev->d_phase, dev->d_bitflags, dev->d_soln, d_tile_component,
+            d_seam_votes, d_vote_count, xsize, ysize, tiles_x);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_collect_seam_votes");
+            cudaFree(d_vote_count);
+            cudaFree(d_seam_votes);
+            cudaFree(d_tile_component);
+            return;
+        }
+        if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
+            cuda_fail(e, "sync seam vote collection");
+            cudaFree(d_vote_count);
+            cudaFree(d_seam_votes);
+            cudaFree(d_tile_component);
+            return;
+        }
+
+        int h_vote_count = 0;
+        if ((e = cudaMemcpy(&h_vote_count, d_vote_count, sizeof(int),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess) {
+            cuda_fail(e, "D2H vote_count");
+            cudaFree(d_vote_count);
+            cudaFree(d_seam_votes);
+            cudaFree(d_tile_component);
+            return;
+        }
+
+        std::vector<SeamVote> h_seam_votes((size_t)h_vote_count);
+        if (h_vote_count > 0) {
+            if ((e = cudaMemcpy(h_seam_votes.data(), d_seam_votes,
+                                (size_t)h_vote_count * sizeof(SeamVote),
+                                cudaMemcpyDeviceToHost)) != cudaSuccess) {
+                cuda_fail(e, "D2H seam_votes");
+                cudaFree(d_vote_count);
+                cudaFree(d_seam_votes);
+                cudaFree(d_tile_component);
+                return;
+            }
+        }
+        cudaFree(d_vote_count);
+        cudaFree(d_seam_votes);
 
         std::vector<int> h_offset_lut;
-        solve_tile_offsets_from_seams(h_phase, h_bitflags, h_local_soln.data(),
-                                      h_tile_component.data(),
-                                      xsize, ysize, h_offset_lut);
+        solve_slot_offsets_from_votes(h_seam_votes.data(), h_vote_count,
+                                      tile_count * UNWRAP_TILE_PIXELS,
+                                      h_offset_lut);
 
-        int *d_offset_lut = nullptr;
         if ((e = cudaMalloc((void **)&d_offset_lut,
                             (size_t)tile_count * UNWRAP_TILE_PIXELS * sizeof(int)))
             != cudaSuccess) {
