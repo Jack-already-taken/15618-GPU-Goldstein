@@ -28,7 +28,7 @@ NVCCFLAGS = -O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/g++-11 -I$(ID
 _DEPS = pi.h util.h file.h extract.h grad.h tiff_io.h unwrap_cuda.h
 DEPS  = $(patsubst %,$(IDIR)/%,$(_DEPS))
 
-_OBJ = main.o util.o extract.o grad.o tiff_io.o unwrap_cuda.o
+_OBJ = main.o util.o extract.o grad.o tiff_io.o unwrap_cuda.o unwrap_cuda_tiled.o
 OBJ  = $(patsubst %,$(ODIR)/%,$(_OBJ))
 
 $(ODIR):
@@ -41,6 +41,8 @@ $(ODIR)/tiff_io.o: tiff_io.cpp $(IDIR)/tiff_io.h $(IDIR)/CImg.h | $(ODIR)
 	$(CXX) -fopenmp $(CXXFLAGS) -c -o $@ $<
 
 $(ODIR)/unwrap_cuda.o: unwrap_cuda.cu $(IDIR)/unwrap_cuda.h | $(ODIR)
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+$(ODIR)/unwrap_cuda_tiled.o: unwrap_cuda_tiled.cu $(IDIR)/unwrap_cuda.h | $(ODIR)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 
 main: $(OBJ)

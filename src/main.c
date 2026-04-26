@@ -1265,6 +1265,35 @@ static void run_unwrap_kernel_parallel_cpu(
     out->elapsed_ms = timediff(t1, t2);
 }
 
+// static void run_unwrap_kernel_serial_cpu(
+//     UnwrapKernelCtx *ctx,
+//     int verify_effective,
+//     unsigned char *snap_after_res,
+//     unsigned char *bf_preunwrap,
+//     UnwrapKernelResult *out)
+// {
+//     clock_t t1, t2;
+//     int MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
+
+//     (void)verify_effective;
+//     (void)snap_after_res;
+//     (void)bf_preunwrap;
+
+//     t1 = clock();
+//     out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+//                                         ctx->xsize, ctx->ysize);
+//     t2 = clock();
+//     printf("  [CPU] residue only: %.4f ms\n", timediff(t1, t2));
+//     GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
+//                                out->num_residues, ctx->xsize, ctx->ysize);
+//     out->num_pieces = UnwrapAroundCutsFrontier(
+//         ctx->phase, ctx->bitflags, ctx->soln,
+//         ctx->xsize, ctx->ysize, ctx->path_order,
+//         ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
+    
+//     out->elapsed_ms = timediff(t1, t2);
+// }
+
 static void run_unwrap_kernel_serial_cpu(
     UnwrapKernelCtx *ctx,
     int verify_effective,
@@ -1272,26 +1301,36 @@ static void run_unwrap_kernel_serial_cpu(
     unsigned char *bf_preunwrap,
     UnwrapKernelResult *out)
 {
-    clock_t t1, t2;
+    clock_t t_total_start, t1, t2;
     int MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
-    (void)verify_effective;
-    (void)snap_after_res;
-    (void)bf_preunwrap;
+    t_total_start = clock();
 
+    /* Stage 1 */
     t1 = clock();
     out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
                                         ctx->xsize, ctx->ysize);
     t2 = clock();
-    printf("  [CPU] residue only: %.4f ms\n", timediff(t1, t2));
+    printf("  [CPU serial] stage 1 residue: %.4f ms\n", timediff(t1, t2));
+
+    /* Stage 2 */
+    t1 = clock();
     GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
                                out->num_residues, ctx->xsize, ctx->ysize);
+    t2 = clock();
+    printf("  [CPU serial] stage 2 branch cuts: %.4f ms\n", timediff(t1, t2));
+
+    /* Stage 3 */
+    t1 = clock();
     out->num_pieces = UnwrapAroundCutsFrontier(
         ctx->phase, ctx->bitflags, ctx->soln,
         ctx->xsize, ctx->ysize, ctx->path_order,
         ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
-    
-    out->elapsed_ms = timediff(t1, t2);
+    t2 = clock();
+    printf("  [CPU serial] stage 3 unwrap: %.4f ms\n", timediff(t1, t2));
+
+    /* Total */
+    out->elapsed_ms = timediff(t_total_start, t2);
 }
 
 static void run_unwrap_kernel_cuda(
@@ -1301,64 +1340,50 @@ static void run_unwrap_kernel_cuda(
     unsigned char *bf_preunwrap,
     UnwrapKernelResult *out)
 {
-    clock_t t1, t2;
-    int      MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
+    clock_t t_total_start, t1, t2;
+    int MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
 
-    // t1 = clock();
+    t_total_start = clock();
 
-    // /* Residues: CPU (serial), same as serial_cpu backend. */
-    // out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
-    //                                     ctx->xsize, ctx->ysize);
-
-    // if (verify_effective && snap_after_res)
-    //     memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
-
-    // /* Residue matching: CUDA only (uses d_bitflags); skipped if alloc failed. */
-    // if (ctx->cuda_dev.d_bitflags)
-    //     unwrap_cuda_launch_residue_matching(ctx->bitflags, &ctx->cuda_dev, MaxCutLen,
-    //                                         out->num_residues, ctx->xsize, ctx->ysize,
-    //                                         ctx->length);
-    // else
-    //     fprintf(stderr,
-    //             "unwrap backend 'cuda': no d_bitflags; skipping CUDA residue-matching "
-    //             "kernel.\n");
-
+    /* Stage 1 */
     t1 = clock();
-
-    printf("  [DEBUG] d_phase=%p d_bitflags=%p\n",
-       (void*)ctx->cuda_dev.d_phase,
-       (void*)ctx->cuda_dev.d_bitflags);
-
-    /* Residues: GPU naive global-memory kernel */
     if (ctx->cuda_dev.d_phase && ctx->cuda_dev.d_bitflags) {
         out->num_residues = unwrap_cuda_launch_residue_identification(
-            ctx->phase,
-            ctx->bitflags,
-            &ctx->cuda_dev,
-            ctx->xsize,
-            ctx->ysize,
-            ctx->length);
+            ctx->phase, ctx->bitflags, &ctx->cuda_dev,
+            ctx->xsize, ctx->ysize, ctx->length);
     } else {
-        fprintf(stderr, "unwrap backend 'cuda': device bufs missing, falling back to CPU residues.\n");
+        fprintf(stderr, "cuda backend: device bufs missing, falling back to CPU residues.\n");
         out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
                                             ctx->xsize, ctx->ysize);
     }
+    t2 = clock();
+    printf("  [CUDA] stage 1 residue wall time: %.4f ms\n", timediff(t1, t2));
 
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
 
-    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues,
-                               ctx->xsize, ctx->ysize);
+    /* Stage 2 */
+    t1 = clock();
+    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
+                               out->num_residues, ctx->xsize, ctx->ysize);
+    t2 = clock();
+    printf("  [CUDA] stage 2 branch cuts wall time: %.4f ms\n", timediff(t1, t2));
 
     if (verify_effective && bf_preunwrap)
         memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
 
-    out->num_pieces = UnwrapAroundCutsFrontier(
-        ctx->phase, ctx->bitflags, ctx->soln, ctx->xsize, ctx->ysize,
-        ctx->path_order, ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
-
+    /* Stage 3 */
+    t1 = clock();
+    unwrap_cuda_launch_unwrapping(
+        ctx->phase, ctx->bitflags, ctx->soln,
+        ctx->gradx, ctx->grady,
+        &ctx->cuda_dev,
+        ctx->xsize, ctx->ysize, ctx->length);
     t2 = clock();
-    out->elapsed_ms = timediff(t1, t2);
+    printf("  [CUDA] stage 3 unwrap wall time: %.4f ms\n", timediff(t1, t2));
+    out->num_pieces = 1;
+
+    out->elapsed_ms = timediff(t_total_start, t2);
 }
 
 static const unwrap_kernel_run_fn g_unwrap_kernel_runners[UNWRAP_BACKEND_COUNT] = {

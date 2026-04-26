@@ -1,0 +1,175 @@
+========== SIZE SCALING ==========
+--- size_256x256 | serial_cpu ---
+Number of threads: 4
+Unwrap backend: serial_cpu
+Loaded TIFF 'phase_data/size_scaling/size_256x256_wrapped.tif' (256 x 256, float32 rad)
+  [CPU serial] stage 1 residue: 2.9640 ms
+  [CPU serial] stage 2 branch cuts: 0.0500 ms
+  [CPU serial] stage 3 unwrap: 0.3940 ms
+Number of residues: 1016
+Number of pieces: 3
+Elapsed time (serial_cpu kernel): 3.413000 ms
+Saved 'test_out/size_256x256_wrapped_unwrapped.tif'
+
+
+--- size_256x256 | cuda ---
+Number of threads: 4
+Unwrap backend: cuda
+Loaded TIFF 'phase_data/size_scaling/size_256x256_wrapped.tif' (256 x 256, float32 rad)
+  [GPU] residue kernel only: 0.0739 ms
+  [CUDA] stage 1 residue wall time: 0.3530 ms
+  [CUDA] stage 2 branch cuts wall time: 0.1970 ms
+  [GPU] frontier seed count: 64959 / 65536 pixels
+  [GPU] BFS unwrap: 2 rounds
+  [CUDA] stage 3 unwrap wall time: 1.1600 ms
+Number of residues: 1016
+Number of pieces: 1
+Elapsed time (cuda kernel): 1.720000 ms
+Saved 'test_out/size_256x256_wrapped_unwrapped.tif'
+
+
+--- size_512x512 | serial_cpu ---
+Number of threads: 4
+Unwrap backend: serial_cpu
+Loaded TIFF 'phase_data/size_scaling/size_512x512_wrapped.tif' (512 x 512, float32 rad)
+  [CPU serial] stage 1 residue: 15.0920 ms
+  [CPU serial] stage 2 branch cuts: 0.1910 ms
+  [CPU serial] stage 3 unwrap: 8.0160 ms
+Number of residues: 2432
+Number of pieces: 1
+Elapsed time (serial_cpu kernel): 23.305000 ms
+Saved 'test_out/size_512x512_wrapped_unwrapped.tif'
+
+
+--- size_512x512 | cuda ---
+Number of threads: 4
+Unwrap backend: cuda
+Loaded TIFF 'phase_data/size_scaling/size_512x512_wrapped.tif' (512 x 512, float32 rad)
+  [GPU] residue kernel only: 0.0216 ms
+  [CUDA] stage 1 residue wall time: 0.3320 ms
+  [CUDA] stage 2 branch cuts wall time: 0.1410 ms
+  [GPU] frontier seed count: 260844 / 262144 pixels
+  [GPU] BFS unwrap: 2 rounds
+  [CUDA] stage 3 unwrap wall time: 1.5690 ms
+Number of residues: 2432
+Number of pieces: 1
+Elapsed time (cuda kernel): 2.046000 ms
+Saved 'test_out/size_512x512_wrapped_unwrapped.tif'
+
+
+--- size_1024x1024 | serial_cpu ---
+Number of threads: 4
+Unwrap backend: serial_cpu
+Loaded TIFF 'phase_data/size_scaling/size_1024x1024_wrapped.tif' (1024 x 1024, float32 rad)
+  [CPU serial] stage 1 residue: 36.4080 ms
+  [CPU serial] stage 2 branch cuts: 3.4940 ms
+  [CPU serial] stage 3 unwrap: 12.3560 ms
+Number of residues: 8238
+Number of pieces: 1
+Elapsed time (serial_cpu kernel): 52.264000 ms
+Saved 'test_out/size_1024x1024_wrapped_unwrapped.tif'
+
+
+--- size_1024x1024 | cuda ---
+Number of threads: 4
+Unwrap backend: cuda
+Loaded TIFF 'phase_data/size_scaling/size_1024x1024_wrapped.tif' (1024 x 1024, float32 rad)
+  [GPU] residue kernel only: 0.0453 ms
+  [CUDA] stage 1 residue wall time: 0.9330 ms
+  [CUDA] stage 2 branch cuts wall time: 0.5150 ms
+  [GPU] frontier seed count: 1044185 / 1048576 pixels
+  [GPU] BFS unwrap: 2 rounds
+  [CUDA] stage 3 unwrap wall time: 5.0810 ms
+Number of residues: 8238
+Number of pieces: 1
+Elapsed time (cuda kernel): 6.533000 ms
+Saved 'test_out/size_1024x1024_wrapped_unwrapped.tif'
+
+
+--- size_2048x2048 | serial_cpu ---
+Number of threads: 4
+Unwrap backend: serial_cpu
+Loaded TIFF 'phase_data/size_scaling/size_2048x2048_wrapped.tif' (2048 x 2048, float32 rad)
+  [CPU serial] stage 1 residue: 71.5460 ms
+  [CPU serial] stage 2 branch cuts: 2.1020 ms
+  [CPU serial] stage 3 unwrap: 49.5560 ms
+Number of residues: 30727
+Number of pieces: 2
+Elapsed time (serial_cpu kernel): 123.212000 ms
+Saved 'test_out/size_2048x2048_wrapped_unwrapped.tif'
+
+
+--- size_2048x2048 | cuda ---
+Number of threads: 4
+Unwrap backend: cuda
+Loaded TIFF 'phase_data/size_scaling/size_2048x2048_wrapped.tif' (2048 x 2048, float32 rad)
+  [GPU] residue kernel only: 0.1584 ms
+  [CUDA] stage 1 residue wall time: 2.9120 ms
+  [CUDA] stage 2 branch cuts wall time: 2.0880 ms
+  [GPU] frontier seed count: 4178009 / 4194304 pixels
+  [GPU] BFS unwrap: 2 rounds
+  [CUDA] stage 3 unwrap wall time: 18.7170 ms
+Number of residues: 30727
+Number of pieces: 1
+Elapsed time (cuda kernel): 23.721000 ms
+Saved 'test_out/size_2048x2048_wrapped_unwrapped.tif'
+
+
+--- size_4096x4096 | serial_cpu ---
+Number of threads: 4
+Unwrap backend: serial_cpu
+Loaded TIFF 'phase_data/size_scaling/size_4096x4096_wrapped.tif' (4096 x 4096, float32 rad)
+  [CPU serial] stage 1 residue: 176.6060 ms
+  [CPU serial] stage 2 branch cuts: 8.1460 ms
+  [CPU serial] stage 3 unwrap: 230.5190 ms
+Number of residues: 122248
+Number of pieces: 1
+Elapsed time (serial_cpu kernel): 415.279000 ms
+Saved 'test_out/size_4096x4096_wrapped_unwrapped.tif'
+
+
+--- size_4096x4096 | cuda ---
+Number of threads: 4
+Unwrap backend: cuda
+Loaded TIFF 'phase_data/size_scaling/size_4096x4096_wrapped.tif' (4096 x 4096, float32 rad)
+  [GPU] residue kernel only: 0.6047 ms
+  [CUDA] stage 1 residue wall time: 14.3850 ms
+  [CUDA] stage 2 branch cuts wall time: 12.5970 ms
+  [GPU] frontier seed count: 16712450 / 16777216 pixels
+  [GPU] BFS unwrap: 2 rounds
+  [CUDA] stage 3 unwrap wall time: 75.9280 ms
+Number of residues: 122248
+Number of pieces: 1
+Elapsed time (cuda kernel): 102.919000 ms
+Saved 'test_out/size_4096x4096_wrapped_unwrapped.tif'
+
+
+--- size_8192x8192 | serial_cpu ---
+Number of threads: 4
+Unwrap backend: serial_cpu
+Loaded TIFF 'phase_data/size_scaling/size_8192x8192_wrapped.tif' (8192 x 8192, float32 rad)
+  [CPU serial] stage 1 residue: 625.4890 ms
+  [CPU serial] stage 2 branch cuts: 33.1700 ms
+  [CPU serial] stage 3 unwrap: 986.9640 ms
+Number of residues: 486436
+Number of pieces: 2
+Elapsed time (serial_cpu kernel): 1645.631000 ms
+Saved 'test_out/size_8192x8192_wrapped_unwrapped.tif'
+
+
+--- size_8192x8192 | cuda ---
+Number of threads: 4
+Unwrap backend: cuda
+Loaded TIFF 'phase_data/size_scaling/size_8192x8192_wrapped.tif' (8192 x 8192, float32 rad)
+  [GPU] residue kernel only: 2.4064 ms
+  [CUDA] stage 1 residue wall time: 41.4330 ms
+  [CUDA] stage 2 branch cuts wall time: 33.0060 ms
+  [GPU] frontier seed count: 66851633 / 67108864 pixels
+  [GPU] BFS unwrap: 2 rounds
+  [CUDA] stage 3 unwrap wall time: 292.5880 ms
+Number of residues: 486436
+Number of pieces: 1
+Elapsed time (cuda kernel): 367.032000 ms
+Saved 'test_out/size_8192x8192_wrapped_unwrapped.tif'
+
+
