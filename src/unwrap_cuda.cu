@@ -90,6 +90,11 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #ifndef STAGE2_CLUSTER_MAX_WINDOW
 #define STAGE2_CLUSTER_MAX_WINDOW 4096
 #endif
+#ifndef STAGE2_POS_CHUNK
+#define STAGE2_POS_CHUNK 1024
+#endif
+
+constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 
 #ifndef STAGE3_BFS_THREADS
 #define STAGE3_BFS_THREADS 256
@@ -154,400 +159,223 @@ __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
 }
 
 
-/* -----------------------------------------------------------------------
- * Stage 2: compact residues, Morton-sort them, and grow local charged
- * clusters.  This is a GPU-friendly Goldstein-style approximation:
- *   - residues are stored as one combined array, not fixed +/− pairs;
- *   - each seed owns a small active cluster;
- *   - nearby residues are searched in Morton order with expanding windows;
- *   - each newly absorbed residue is connected to the nearest active residue;
- *   - unresolved non-neutral clusters are connected to the nearest border.
- * ----------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/*  (i, j) encoding helpers                                                  */
+/* ------------------------------------------------------------------------- */
 
-__device__ __forceinline__ unsigned int part1by1(unsigned int x)
+__device__ __forceinline__ int encode_ij(int i, int j)
 {
-    x &= 0x0000ffffu;
-    x = (x ^ (x << 8)) & 0x00ff00ffu;
-    x = (x ^ (x << 4)) & 0x0f0f0f0fu;
-    x = (x ^ (x << 2)) & 0x33333333u;
-    x = (x ^ (x << 1)) & 0x55555555u;
-    return x;
+    return (j << 16) | (i & 0xFFFF);
 }
 
-__device__ __host__ __forceinline__ unsigned int morton2d_hostdev(unsigned int x, unsigned int y)
+__device__ __forceinline__ void decode_ij(int enc, int &i, int &j)
 {
-#ifdef __CUDA_ARCH__
-    return (part1by1(y) << 1) | part1by1(x);
-#else
-    x &= 0x0000ffffu;
-    x = (x ^ (x << 8)) & 0x00ff00ffu;
-    x = (x ^ (x << 4)) & 0x0f0f0f0fu;
-    x = (x ^ (x << 2)) & 0x33333333u;
-    x = (x ^ (x << 1)) & 0x55555555u;
-    y &= 0x0000ffffu;
-    y = (y ^ (y << 8)) & 0x00ff00ffu;
-    y = (y ^ (y << 4)) & 0x0f0f0f0fu;
-    y = (y ^ (y << 2)) & 0x33333333u;
-    y = (y ^ (y << 1)) & 0x55555555u;
-    return (y << 1) | x;
-#endif
+    j = (enc >> 16) & 0xFFFF;
+    i =  enc        & 0xFFFF;
 }
 
-__device__ __forceinline__ void atomic_or_byte(unsigned char *flags, int idx, unsigned char mask)
+/* Closed-form nearest image edge for pixel (i, j). */
+__device__ __forceinline__ int nearest_edge_enc(int i, int j, int xsize, int ysize)
 {
-    unsigned int *word = (unsigned int *)(flags + (idx & ~3));
-    const unsigned int bit = ((unsigned int)mask) << ((idx & 3) * 8);
-    atomicOr(word, bit);
+    const int dT = j,                 dB = (ysize - 1) - j;
+    const int dL = i,                 dR = (xsize - 1) - i;
+    int bi = i, bj = 0, bd = dT;                 /* top edge */
+    if (dB < bd) { bd = dB; bi = i;         bj = ysize - 1; }
+    if (dL < bd) { bd = dL; bi = 0;         bj = j;         }
+    if (dR < bd) {          bi = xsize - 1; bj = j;         }
+    return encode_ij(bi, bj);
 }
 
-__device__ __forceinline__ int iabs_dev(int x) { return x < 0 ? -x : x; }
-
-__device__ void d_place_cut(unsigned char *flags, int a, int b, int c, int d,
-                            int xsize, int ysize)
+/* Stamp kBranchCut into bitflags[j*xsize + i] via a 32-bit atomicOr on the
+ * containing word (CUDA doesn't expose portable 8-bit atomics). cudaMalloc
+ * returns 256-byte aligned pointers so the word access is always safe. */
+__device__ __forceinline__ void stamp_branch_cut(unsigned char *bitflags,
+                                                 int xsize, int i, int j)
 {
-    /* Same endpoint convention as CPU PlaceCut: residue coordinates are the
-       upper-left corner of a 2x2 wrapped loop, so cuts are shifted onto the
-       intervening pixels depending on direction. */
-    if (c > a && a > 0) a++;
-    else if (c < a && c > 0) c++;
-    if (d > b && b > 0) b++;
-    else if (d < b && d > 0) d++;
-
-    if (a < 0) a = 0; if (a >= xsize) a = xsize - 1;
-    if (c < 0) c = 0; if (c >= xsize) c = xsize - 1;
-    if (b < 0) b = 0; if (b >= ysize) b = ysize - 1;
-    if (d < 0) d = 0; if (d >= ysize) d = ysize - 1;
-
-    if (a == c && b == d) {
-        atomic_or_byte(flags, b * xsize + a, kBranchCut);
-        return;
-    }
-
-    const int m = iabs_dev(c - a);
-    const int n = iabs_dev(d - b);
-    if (m > n) {
-        const int istep = (a < c) ? 1 : -1;
-        const float r = (float)(d - b) / (float)(c - a);
-        for (int i = a; i != c + istep; i += istep) {
-            int j = b + (int)((float)(i - a) * r + 0.5f);
-            if ((unsigned)i < (unsigned)xsize && (unsigned)j < (unsigned)ysize)
-                atomic_or_byte(flags, j * xsize + i, kBranchCut);
-        }
-    } else {
-        const int jstep = (b < d) ? 1 : -1;
-        const float r = (float)(c - a) / (float)(d - b);
-        for (int j = b; j != d + jstep; j += jstep) {
-            int i = a + (int)((float)(j - b) * r + 0.5f);
-            if ((unsigned)i < (unsigned)xsize && (unsigned)j < (unsigned)ysize)
-                atomic_or_byte(flags, j * xsize + i, kBranchCut);
-        }
-    }
-}
-
-__device__ __forceinline__ void nearest_border(int x, int y, int xsize, int ysize,
-                                                int *bx, int *by)
-{
-    int dl = x;
-    int dr = xsize - 1 - x;
-    int dt = y;
-    int db = ysize - 1 - y;
-    int best = dl;
-    *bx = 0; *by = y;
-    if (dr < best) { best = dr; *bx = xsize - 1; *by = y; }
-    if (dt < best) { best = dt; *bx = x; *by = 0; }
-    if (db < best) { *bx = x; *by = ysize - 1; }
-}
-
-__global__ void k_pack_residues_morton(const unsigned char *bitflags,
-                                       unsigned int *keys,
-                                       int *packed,
-                                       int *count,
-                                       int xsize,
-                                       int ysize,
-                                       int length)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= length) return;
-    const unsigned char f = bitflags[idx];
-    const bool pos = (f & kPosRes) != 0;
-    const bool neg = (f & kNegRes) != 0;
-    if (!pos && !neg) return;
-
-    const int slot = atomicAdd(count, 1);
-    const int x = idx % xsize;
-    const int y = idx / xsize;
-    keys[slot] = morton2d_hostdev((unsigned int)x, (unsigned int)y);
-    packed[slot] = idx | (neg ? INT_MIN : 0);
-}
-
-__device__ __forceinline__ int unpack_idx(int p) { return p & INT_MAX; }
-__device__ __forceinline__ int unpack_charge(int p) { return (p < 0) ? -1 : 1; }
-
-__global__ void k_goldstein_morton_growth(unsigned char *bitflags,
-                                          const int *packed_sorted,
-                                          int *claimed,
-                                          int nres,
-                                          int max_cut_len,
-                                          int xsize,
-                                          int ysize)
-{
-    const int seed_ord = blockIdx.x * blockDim.x + threadIdx.x;
-    if (seed_ord >= nres) return;
-
-    const int seed_pack = packed_sorted[seed_ord];
-    const int seed_idx = unpack_idx(seed_pack);
-    const int seed_charge = unpack_charge(seed_pack);
-
-    /* A residue can only seed one cluster.  Other clusters may absorb it first. */
-    if (atomicCAS(&claimed[seed_ord], 0, seed_ord + 1) != 0)
-        return;
-
-    constexpr int MAX_ACTIVE = STAGE2_CLUSTER_MAX_ACTIVE;
-    int active_idx[MAX_ACTIVE];
-    int active_x[MAX_ACTIVE];
-    int active_y[MAX_ACTIVE];
-    int active_n = 1;
-
-    active_idx[0] = seed_idx;
-    active_x[0] = seed_idx % xsize;
-    active_y[0] = seed_idx / xsize;
-    int charge = seed_charge;
-
-    const int max_window = nres < STAGE2_CLUSTER_MAX_WINDOW ? nres : STAGE2_CLUSTER_MAX_WINDOW;
-    for (int window = 8; charge != 0 && window <= max_window && active_n < MAX_ACTIVE; window <<= 1) {
-        int best_ord = -1;
-        int best_dist2 = INT_MAX;
-        int best_parent = 0;
-        int best_idx = -1;
-        int best_charge = 0;
-
-        int lo = seed_ord - window;
-        int hi = seed_ord + window;
-        if (lo < 0) lo = 0;
-        if (hi >= nres) hi = nres - 1;
-
-        for (int ord = lo; ord <= hi; ++ord) {
-            if (claimed[ord] != 0) continue;
-            const int p = packed_sorted[ord];
-            const int idx = unpack_idx(p);
-            const int cx = idx % xsize;
-            const int cy = idx / xsize;
-
-            int parent = 0;
-            int local_best = INT_MAX;
-            for (int a = 0; a < active_n; ++a) {
-                const int dx = cx - active_x[a];
-                const int dy = cy - active_y[a];
-                const int d2 = dx * dx + dy * dy;
-                if (d2 < local_best) {
-                    local_best = d2;
-                    parent = a;
-                }
-            }
-
-            if (local_best < best_dist2) {
-                best_dist2 = local_best;
-                best_ord = ord;
-                best_parent = parent;
-                best_idx = idx;
-                best_charge = unpack_charge(p);
-            }
-        }
-
-        if (best_ord < 0)
-            continue;
-        if (max_cut_len > 0 && best_dist2 > max_cut_len * max_cut_len)
-            continue;
-        if (atomicCAS(&claimed[best_ord], 0, seed_ord + 1) != 0)
-            continue;
-
-        const int bx = best_idx % xsize;
-        const int by = best_idx / xsize;
-        d_place_cut(bitflags, bx, by, active_x[best_parent], active_y[best_parent], xsize, ysize);
-
-        active_idx[active_n] = best_idx;
-        active_x[active_n] = bx;
-        active_y[active_n] = by;
-        active_n++;
-        charge += best_charge;
-    }
-
-    if (charge != 0) {
-        /* CPU Goldstein connects the active cluster to a border when it cannot
-           neutralize locally.  Here we use the active residue nearest any image
-           border, then draw one CPU-convention cut to that border. */
-        int best_a = 0;
-        int best_d = INT_MAX;
-        for (int a = 0; a < active_n; ++a) {
-            const int x = active_x[a], y = active_y[a];
-            int d = x;
-            int t = xsize - 1 - x; if (t < d) d = t;
-            t = y; if (t < d) d = t;
-            t = ysize - 1 - y; if (t < d) d = t;
-            if (d < best_d) { best_d = d; best_a = a; }
-        }
-        int bx, by;
-        nearest_border(active_x[best_a], active_y[best_a], xsize, ysize, &bx, &by);
-        d_place_cut(bitflags, active_x[best_a], active_y[best_a], bx, by, xsize, ysize);
-    }
+    const int     idx      = j * xsize + i;
+    unsigned int *word_ptr = reinterpret_cast<unsigned int*>(bitflags) + (idx >> 2);
+    const unsigned int bit = ((unsigned int)kBranchCut) << ((idx & 3) * 8);
+    atomicOr(word_ptr, bit);
 }
 
 
-/* Correctness-first Stage 2 kernel.
- *
- * The previous parallel one-thread-per-seed growth can degenerate into every
- * residue claiming itself before any cluster can absorb neighbors.  Then most
- * clusters remain non-neutral and the fallback connects them to the border,
- * producing the star-like branch-cut image.  This serial GPU kernel preserves
- * the important Goldstein invariant: one cluster is grown to neutral charge
- * before the next seed is allowed to start.
- */
-__global__ void k_goldstein_morton_growth_ordered(unsigned char *bitflags,
-                                                  const int *packed_sorted,
-                                                  int *claimed,
-                                                  int nres,
-                                                  int max_cut_len,
-                                                  int xsize,
-                                                  int ysize)
+__host__ __device__ __forceinline__ bool is_blocked_flag(unsigned char b)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-
-    constexpr int MAX_ACTIVE = STAGE2_CLUSTER_MAX_ACTIVE;
-
-    for (int seed_ord = 0; seed_ord < nres; ++seed_ord) {
-        if (claimed[seed_ord] != 0) continue;
-
-        const int seed_pack = packed_sorted[seed_ord];
-        const int seed_idx = unpack_idx(seed_pack);
-        const int seed_charge = unpack_charge(seed_pack);
-
-        const int cluster_id = seed_ord + 1;
-        claimed[seed_ord] = cluster_id;
-
-        int active_x[MAX_ACTIVE];
-        int active_y[MAX_ACTIVE];
-        int active_n = 1;
-        active_x[0] = seed_idx % xsize;
-        active_y[0] = seed_idx / xsize;
-        int charge = seed_charge;
-
-        /* CPU Goldstein uses expanding odd boxes up to 2*MaxCutLen.  Here we
-           use squared Euclidean distance around every active residue, which is
-           not bit-identical but prevents premature border fallback and supports
-           multi-residue clusters. */
-        for (int radius = 1;
-             charge != 0 && radius <= max_cut_len && active_n < MAX_ACTIVE;
-             ++radius) {
-
-            bool absorbed_this_radius = true;
-            while (charge != 0 && absorbed_this_radius && active_n < MAX_ACTIVE) {
-                absorbed_this_radius = false;
-                int best_ord = -1;
-                int best_parent = 0;
-                int best_idx = -1;
-                int best_charge = 0;
-                int best_dist2 = INT_MAX;
-                const int r2 = radius * radius;
-
-                for (int ord = 0; ord < nres; ++ord) {
-                    if (claimed[ord] != 0) continue;
-                    const int p = packed_sorted[ord];
-                    const int idx = unpack_idx(p);
-                    const int cx = idx % xsize;
-                    const int cy = idx / xsize;
-
-                    int parent = 0;
-                    int local_best = INT_MAX;
-                    for (int a = 0; a < active_n; ++a) {
-                        const int dx = cx - active_x[a];
-                        const int dy = cy - active_y[a];
-                        const int d2 = dx * dx + dy * dy;
-                        if (d2 < local_best) {
-                            local_best = d2;
-                            parent = a;
-                        }
-                    }
-
-                    if (local_best <= r2 && local_best < best_dist2) {
-                        best_dist2 = local_best;
-                        best_ord = ord;
-                        best_parent = parent;
-                        best_idx = idx;
-                        best_charge = unpack_charge(p);
-                    }
-                }
-
-                if (best_ord >= 0) {
-                    claimed[best_ord] = cluster_id;
-                    const int bx = best_idx % xsize;
-                    const int by = best_idx / xsize;
-                    d_place_cut(bitflags, bx, by,
-                                active_x[best_parent], active_y[best_parent],
-                                xsize, ysize);
-                    active_x[active_n] = bx;
-                    active_y[active_n] = by;
-                    ++active_n;
-                    charge += best_charge;
-                    absorbed_this_radius = true;
-                }
-            }
-        }
-
-        if (charge != 0) {
-            int best_a = 0;
-            int best_d = INT_MAX;
-            for (int a = 0; a < active_n; ++a) {
-                const int x = active_x[a], y = active_y[a];
-                int d = x;
-                int t = xsize - 1 - x; if (t < d) d = t;
-                t = y; if (t < d) d = t;
-                t = ysize - 1 - y; if (t < d) d = t;
-                if (d < best_d) { best_d = d; best_a = a; }
-            }
-            int bx, by;
-            nearest_border(active_x[best_a], active_y[best_a], xsize, ysize, &bx, &by);
-            d_place_cut(bitflags, active_x[best_a], active_y[best_a], bx, by, xsize, ysize);
-        }
-    }
+    return (b & (kBranchCut | kBorder)) != 0;
 }
 
-/* -----------------------------------------------------------------------
- * Stage 3 kernel 1 (BFS approach): seed initialisation
- * One thread per pixel. Pixels that are not BORDER/BRANCH_CUT/UNWRAPPED
- * and have at least one valid non-AVOID neighbor are elected seeds.
- * For simplicity we elect every valid pixel and let the BFS handle it —
- * the frontier compaction via atomicAdd keeps this correct.
- * ----------------------------------------------------------------------- */
+__device__ __forceinline__ bool is_valid_unwrap_pixel(const unsigned char *bitflags,
+                                                      int idx)
+{
+    return !is_blocked_flag(bitflags[idx]);
+}
 
-constexpr unsigned char kAvoid      = kBranchCut | kBorder;
+static inline float host_wrap_diff(float p1, float p2)
+{
+    float r = p1 - p2;
+    if (r > (float)PI)
+        r -= (float)TWOPI;
+    else if (r < -(float)PI)
+        r += (float)TWOPI;
+    return r;
+}
 
-__global__ void k_init_seeds(const float        *phase,
-                              unsigned char      *bitflags,
-                              float              *soln,
-                              int                *frontier,
-                              int                *frontier_count,
-                              int                 xsize,
-                              int                 ysize)
+static inline int div_up_int(int a, int b)
+{
+    return (a + b - 1) / b;
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Kernel: pack residue coordinates out of bitflags                         */
+/* ------------------------------------------------------------------------- */
+/*  Residues only exist at (i, j) with i < xsize-1 and j < ysize-1 because   */
+/*  k_identify_residues only writes in that subrectangle. We could scan the  */
+/*  whole image and nothing bad would happen, but the early return matches   */
+/*  the residue-valid region exactly and skips a pointless bitflags read.    */
+
+__global__ void k_pack_residues(const unsigned char *bitflags,
+                                int *pos_residues, int *neg_residues,
+                                int xsize, int ysize)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= xsize || j >= ysize) return;
+    if (i >= xsize - 1 || j >= ysize - 1)
+        return;
 
-    const int k = j * xsize + i;
-    if (bitflags[k] & kAvoid) return;
+    const unsigned char b = bitflags[j * xsize + i];
+    const int enc = encode_ij(i, j);
 
-    /* Elect this pixel as a seed: initialise soln and mark UNWRAPPED */
-    soln[k] = phase[k];
-    bitflags[k] |= kUnwrapped;
-    const int slot = atomicAdd(frontier_count, 1);
-    frontier[slot] = k;
+    if (b & kPosRes) {
+        const int idx = atomicAdd(&pos_residues[0], 1);
+        pos_residues[1 + idx] = enc;
+    } else if (b & kNegRes) {
+        const int idx = atomicAdd(&neg_residues[0], 1);
+        neg_residues[1 + idx] = enc;
+    }
 }
 
-/* -----------------------------------------------------------------------
- * Stage 3 kernel 2 (BFS approach): one frontier expansion round
- * One thread per pixel in the current frontier (d_in / n_in).
- * Unwrapped neighbors are pushed into d_out via atomicAdd on *n_out.
- * ----------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/*  Kernel: minority -> nearest-majority matching                            */
+/* ------------------------------------------------------------------------- */
+/*  One thread per minority residue. The block cooperatively streams the     */
+/*  majority array through shared memory in POS_CHUNK tiles. Each thread     */
+/*  writes its pair into d_pairs[2*min_idx .. 2*min_idx + 1].                */
+
+__global__ void k_match_residues(const int *__restrict__ d_minority,
+                                 const int *__restrict__ d_majority,
+                                 int n_min, int n_maj,
+                                 int *__restrict__ d_pairs,
+                                 int xsize, int ysize)
+{
+    __shared__ int s_maj[POS_CHUNK];
+
+    const int tid     = threadIdx.x;
+    const int min_idx = blockIdx.x * blockDim.x + tid;
+
+    int        my_enc   = 0, mi = 0, mj = 0;
+    int        best_d2  = INT_MAX;
+    int        best_enc = -1;
+    const bool active   = (min_idx < n_min);
+    if (active) {
+        my_enc = d_minority[1 + min_idx];
+        decode_ij(my_enc, mi, mj);
+    }
+
+    for (int cs = 0; cs < n_maj; cs += POS_CHUNK) {
+        const int clen = min(POS_CHUNK, n_maj - cs);
+
+        /* cooperative load of one chunk of the majority array */
+        for (int k = tid; k < clen; k += blockDim.x)
+            s_maj[k] = d_majority[1 + cs + k];
+        __syncthreads();
+
+        if (active) {
+            #pragma unroll 4
+            for (int k = 0; k < clen; ++k) {
+                int pi, pj;
+                decode_ij(s_maj[k], pi, pj);
+                const int di = pi - mi;
+                const int dj = pj - mj;
+                const int d2 = di*di + dj*dj;
+                const bool better = (d2 < best_d2);
+                best_d2  = better ? d2       : best_d2;
+                best_enc = better ? s_maj[k] : best_enc;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        /* Only reachable when n_maj == 0 (no majority residues at all). */
+        if (best_enc < 0)
+            best_enc = nearest_edge_enc(mi, mj, xsize, ysize);
+
+        d_pairs[2 * min_idx    ] = my_enc;
+        d_pairs[2 * min_idx + 1] = best_enc;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Kernel: leftover majority -> nearest image edge (closed form)            */
+/* ------------------------------------------------------------------------- */
+/*  Writes into the tail of the same d_pairs buffer the matcher used, so    */
+/*  one rasterize pass over d_pairs[0 .. n_maj) covers everything.          */
+
+__global__ void k_fill_leftovers(const int *__restrict__ d_majority,
+                                 int n_min, int n_leftover,
+                                 int *__restrict__ d_pairs,
+                                 int xsize, int ysize)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_leftover) return;
+
+    const int slot = n_min + t;
+    const int enc  = d_majority[1 + slot];
+    int i, j;
+    decode_ij(enc, i, j);
+
+    d_pairs[2 * slot    ] = enc;
+    d_pairs[2 * slot + 1] = nearest_edge_enc(i, j, xsize, ysize);
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Kernel: rasterize each pair as a Bresenham line of kBranchCut bits       */
+/* ------------------------------------------------------------------------- */
+/*  Standard all-octants integer Bresenham. di is kept positive and dj      */
+/*  negative so the error test is a two-way compare against one positive    */
+/*  and one negative value, which is the canonical branchless form.         */
+
+__global__ void k_rasterize_cuts(const int *__restrict__ d_pairs,
+                                 int n_pairs,
+                                 unsigned char *__restrict__ bitflags,
+                                 int xsize, int ysize)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_pairs) return;
+
+    const int a = d_pairs[2 * t    ];
+    const int b = d_pairs[2 * t + 1];
+
+    int i0, j0, i1, j1;
+    decode_ij(a, i0, j0);
+    decode_ij(b, i1, j1);
+
+    int di =  abs(i1 - i0), si = (i0 < i1) ? 1 : -1;
+    int dj = -abs(j1 - j0), sj = (j0 < j1) ? 1 : -1;
+    int err = di + dj;
+
+    int i = i0, j = j0;
+    for (;;) {
+        if ((unsigned)i < (unsigned)xsize && (unsigned)j < (unsigned)ysize)
+            stamp_branch_cut(bitflags, xsize, i, j);
+        if (i == i1 && j == j1) break;
+        const int e2 = 2 * err;
+        if (e2 >= dj) { err += dj; i += si; }
+        if (e2 <= di) { err += di; j += sj; }
+    }
+}
+
+
 // __global__ void k_bfs_expand(const float        *phase,
 //                               unsigned char      *bitflags,
 //                               float              *soln,
@@ -717,11 +545,17 @@ static int cuda_fail(cudaError_t e, const char *msg)
     return (int)e;
 }
 
-// static dim3 residue_grid(int xsize, int ysize)
-// {
-//     constexpr int bx = 16, by = 16;
-//     return dim3((xsize + bx - 2) / bx, (ysize + by - 2) / by);
-// }
+static dim3 residue_grid(int xsize, int ysize)
+{
+    constexpr int bx = STAGE1_RESIDUE_TILE_W;
+    constexpr int by = STAGE1_RESIDUE_TILE_H;
+    return dim3((xsize + bx - 2) / bx, (ysize + by - 2) / by);
+}
+
+static inline int residue_capacity(int length)
+{
+    return length / 5 + 4;
+}
 
 } /* namespace */
 
@@ -765,9 +599,7 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
         return (int)e;
     }
 
-    /* Stage 2 scratch buffers declared in unwrap_cuda.h.  The new Morton-growth
-       implementation allocates additional local temporaries inside Stage 2, but
-       keeping these fields allocated preserves compatibility with older code. */
+    /* Stage 2 original scratch buffers. Counters live at [0], residue data starts at [1]. */
     e = cudaMalloc((void **)&out->d_pos_residues, (size_t)length * sizeof(int));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
     e = cudaMalloc((void **)&out->d_neg_residues, (size_t)length * sizeof(int));
@@ -882,91 +714,120 @@ extern "C" int unwrap_cuda_launch_residue_identification(
 }
 
 extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
-                                                    const UnwrapCudaDeviceBufs *dev, int max_cut_len,
-                                                    int num_res, int xsize, int ysize, int length)
+                                                    const UnwrapCudaDeviceBufs *dev,
+                                                    int max_cut_len, int num_res,
+                                                    int xsize, int ysize, int length)
 {
-    if (length < 1 || !h_bitflags || !dev || !dev->d_bitflags || xsize < 2 || ysize < 2)
+    (void)max_cut_len;
+    (void)num_res;
+
+    if (length < 1 || !h_bitflags || !dev || !dev->d_bitflags
+        || !dev->d_pos_residues || !dev->d_neg_residues || !dev->d_pairs)
         return;
+    if (xsize >= 65536 || ysize >= 65536) {
+        fprintf(stderr, "residue_matching: image too large for 16-bit encoding\n");
+        return;
+    }
 
     cudaError_t e;
-    unsigned int *d_keys = nullptr;
-    int *d_packed = nullptr;
-    int *d_count = nullptr;
-    int *d_claimed = nullptr;
-    int h_count = 0;
 
-    const size_t bitflag_bytes = (((size_t)length + 3u) & ~((size_t)3u)) * sizeof(unsigned char);
-
-    if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length * sizeof(unsigned char),
+    /* ---- H2D bitflags ---------------------------------------------------- */
+    if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags, length,
                         cudaMemcpyHostToDevice)) != cudaSuccess) {
-        cuda_fail(e, "Stage2 H2D bitflags"); return;
+        cuda_fail(e, "H2D bitflags"); return;
     }
-    /* Zero the padding bytes so byte-level atomicOr on the last 32-bit word is safe. */
-    if (bitflag_bytes > (size_t)length)
-        cudaMemset(((unsigned char *)dev->d_bitflags) + length, 0, bitflag_bytes - (size_t)length);
 
-    if ((e = cudaMalloc((void **)&d_keys, (size_t)length * sizeof(unsigned int))) != cudaSuccess) goto fail;
-    if ((e = cudaMalloc((void **)&d_packed, (size_t)length * sizeof(int))) != cudaSuccess) goto fail;
-    if ((e = cudaMalloc((void **)&d_count, sizeof(int))) != cudaSuccess) goto fail;
-    if ((e = cudaMemset(d_count, 0, sizeof(int))) != cudaSuccess) goto fail;
+    /* ---- Reset only the counter slots ------------------------------------ */
+    cudaMemsetAsync(dev->d_pos_residues, 0, sizeof(int));
+    cudaMemsetAsync(dev->d_neg_residues, 0, sizeof(int));
 
+    /* ---- Kernel 1: pack residues ----------------------------------------- */
     {
-        const int threads = STAGE2_PACK_THREADS;
-        const int blocks = (length + threads - 1) / threads;
-        k_pack_residues_morton<<<blocks, threads>>>(dev->d_bitflags, d_keys, d_packed,
-                                                    d_count, xsize, ysize, length);
-        if ((e = cudaGetLastError()) != cudaSuccess) goto fail;
-        if ((e = cudaDeviceSynchronize()) != cudaSuccess) goto fail;
+        dim3 block(16, 16);
+        dim3 grid = residue_grid(xsize, ysize);
+        k_pack_residues<<<grid, block>>>(dev->d_bitflags,
+                                         dev->d_pos_residues,
+                                         dev->d_neg_residues,
+                                         xsize, ysize);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_pack_residues"); return;
+        }
     }
 
-    if ((e = cudaMemcpy(&h_count, d_count, sizeof(int), cudaMemcpyDeviceToHost)) != cudaSuccess) goto fail;
-    if (h_count <= 0) {
-        (void)cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char),
-                         cudaMemcpyDeviceToHost);
-        cudaFree(d_keys); cudaFree(d_packed); cudaFree(d_count);
+    int h_n_pos = 0, h_n_neg = 0;
+    cudaMemcpy(&h_n_pos, dev->d_pos_residues, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_n_neg, dev->d_neg_residues, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (h_n_pos == 0 && h_n_neg == 0) {
+        /* No residues — nothing to do. */
+        cudaMemcpy(h_bitflags, dev->d_bitflags, length, cudaMemcpyDeviceToHost);
         return;
     }
 
-    /* Sort compact residues by Morton key. */
-    try {
-        thrust::device_ptr<unsigned int> keys_begin(d_keys);
-        thrust::device_ptr<int> vals_begin(d_packed);
-        thrust::sort_by_key(keys_begin, keys_begin + h_count, vals_begin);
-    } catch (...) {
-        fprintf(stderr, "unwrap_cuda: Stage2 thrust::sort_by_key failed\n");
-        goto cleanup;
+    /* Capacity sanity check. If this fires, the residue density of the      */
+    /* input exceeded the allocator's assumed upper bound; the atomicAdd in  */
+    /* k_pack_residues has already overrun the buffer and device memory is   */
+    /* corrupt. Bail loudly rather than producing silently wrong output.     */
+    const int cap = residue_capacity(length);
+    if (h_n_pos > cap || h_n_neg > cap) {
+        fprintf(stderr, "residue_matching: residue count exceeds capacity "
+                        "(pos=%d neg=%d cap=%d) — raise residue_capacity()\n",
+                h_n_pos, h_n_neg, cap);
+        return;
     }
 
-    if ((e = cudaMalloc((void **)&d_claimed, (size_t)h_count * sizeof(int))) != cudaSuccess) goto fail;
-    if ((e = cudaMemset(d_claimed, 0, (size_t)h_count * sizeof(int))) != cudaSuccess) goto fail;
+    /* Pick minority vs majority. */
+    const int  n_min = (h_n_pos <= h_n_neg) ? h_n_pos : h_n_neg;
+    const int  n_maj = (h_n_pos <= h_n_neg) ? h_n_neg : h_n_pos;
+    int *const d_min = (h_n_pos <= h_n_neg) ? dev->d_pos_residues
+                                            : dev->d_neg_residues;
+    int *const d_maj = (h_n_pos <= h_n_neg) ? dev->d_neg_residues
+                                            : dev->d_pos_residues;
 
-    {
-        /* Correctness-first ordered growth: one cluster is completed before
-           the next seed starts.  This avoids the all-residues-to-border race
-           caused by launching one parallel seed per residue. */
-        k_goldstein_morton_growth_ordered<<<1, 1>>>(dev->d_bitflags, d_packed, d_claimed,
-                                                    h_count, max_cut_len, xsize, ysize);
-        if ((e = cudaGetLastError()) != cudaSuccess) goto fail;
-        if ((e = cudaDeviceSynchronize()) != cudaSuccess) goto fail;
+    /* ---- Kernel 2: minority -> majority matching ------------------------- */
+    if (n_min > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (n_min + threads - 1) / threads;
+        k_match_residues<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
+                                              dev->d_pairs, xsize, ysize);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_match_residues"); return;
+        }
     }
 
-    if ((e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char),
-                        cudaMemcpyDeviceToHost)) != cudaSuccess) goto fail;
+    /* ---- Kernel 3: leftover majority -> edge ----------------------------- */
+    const int n_leftover = n_maj - n_min;
+    if (n_leftover > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (n_leftover + threads - 1) / threads;
+        k_fill_leftovers<<<blocks, threads>>>(d_maj, n_min, n_leftover,
+                                              dev->d_pairs, xsize, ysize);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_fill_leftovers"); return;
+        }
+    }
 
-    printf("  [GPU] Stage2 Morton-growth residues: packed=%d expected=%d\n", h_count, num_res);
+    /* ---- Kernel 4: one rasterize pass over the combined buffer ----------- */
+    const int n_total = n_maj;  /* == n_min + n_leftover */
+    if (n_total > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (n_total + threads - 1) / threads;
+        k_rasterize_cuts<<<blocks, threads>>>(dev->d_pairs, n_total,
+                                              dev->d_bitflags, xsize, ysize);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_rasterize_cuts"); return;
+        }
+    }
 
-cleanup:
-    cudaFree(d_keys);
-    cudaFree(d_packed);
-    cudaFree(d_count);
-    cudaFree(d_claimed);
-    return;
+    if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
+        cuda_fail(e, "sync after stage 2"); return;
+    }
 
-fail:
-    cuda_fail(e, "Stage2 Morton-growth");
-    goto cleanup;
+    /* ---- D2H bitflags ---------------------------------------------------- */
+    if ((e = cudaMemcpy(h_bitflags, dev->d_bitflags, length,
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        cuda_fail(e, "D2H bitflags");
 }
-
 
 extern "C" void unwrap_cuda_launch_unwrapping(
     float *h_phase, unsigned char *h_bitflags, float *h_soln,
