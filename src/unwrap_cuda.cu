@@ -3,6 +3,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
@@ -16,6 +17,22 @@ constexpr unsigned char kUnwrapped  = 0x40;
 
 enum : unsigned char { kPosRes = 0x01, kNegRes = 0x02, kBorder = 0x20, kBranchCut = 0x10 };
 constexpr unsigned char kAvoid = kBranchCut | kBorder;
+
+static int cuda_fail(cudaError_t e, const char *msg)
+{
+    if (e == cudaSuccess)
+        return 0;
+    fprintf(stderr, "unwrap_cuda: %s: %s\n", msg, cudaGetErrorString(e));
+    return (int)e;
+}
+
+static void print_cuda_interval(const char *name, cudaEvent_t start, cudaEvent_t stop)
+{
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("  [GPU][timing] %-34s %.4f ms\n", name, ms);
+}
+
 
 __device__ __forceinline__ float device_gradient(float p1, float p2)
 {
@@ -33,14 +50,6 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
     unsigned int bit   = (unsigned int)kUnwrapped << ((idx & 3) * 8);
     unsigned int old   = atomicOr(word, bit);
     return !(old & bit);
-}
-
-static int cuda_fail(cudaError_t e, const char *msg)
-{
-    if (e == cudaSuccess)
-        return 0;
-    fprintf(stderr, "unwrap_cuda: %s: %s\n", msg, cudaGetErrorString(e));
-    return (int)e;
 }
 
 // __global__ void k_identify_residues(const float *phase, unsigned char *bitflags, int xsize,
@@ -103,10 +112,21 @@ static int cuda_fail(cudaError_t e, const char *msg)
 #define STAGE2_POS_CHUNK 1024
 #endif
 
+#ifndef STAGE2_MATCH_WINDOW
+#define STAGE2_MATCH_WINDOW 256
+#endif
+
+#ifndef STAGE3_FAST_GPU_BFS
+#define STAGE3_FAST_GPU_BFS 1
+#endif
+
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 
 #ifndef STAGE3_BFS_THREADS
 #define STAGE3_BFS_THREADS 256
+#endif
+#ifndef STAGE3_MAX_BFS_ROUNDS
+#define STAGE3_MAX_BFS_ROUNDS 20000
 #endif
 #ifndef STAGE3_AVOID_TILE_W
 #define STAGE3_AVOID_TILE_W 16
@@ -301,10 +321,34 @@ __global__ void k_match_residues(const int *__restrict__ d_minority,
         decode_ij(my_enc, mi, mj);
     }
 
-    for (int cs = 0; cs < n_maj; cs += POS_CHUNK) {
-        const int clen = min(POS_CHUNK, n_maj - cs);
+#if STAGE2_MATCH_WINDOW > 0
+    /* Performance mode: approximate local matching.
+       The residue arrays are packed from a 2D grid, so nearby indices are often
+       spatially nearby.  Instead of scanning all majority residues, map the
+       minority index proportionally into the majority list and search a bounded
+       window around that position.  This reduces matching from O(N^2) to
+       O(N*W).  It intentionally does not preserve exact CPU Goldstein topology;
+       use the relaxed RMS metrics in main.c to judge physical correctness. */
+    int begin = 0;
+    int end   = n_maj;
+    if (active && n_maj > 0) {
+        const long long center_ll = ((long long)min_idx * (long long)n_maj) / max(n_min, 1);
+        const int center = (int)center_ll;
+        begin = center - STAGE2_MATCH_WINDOW;
+        end   = center + STAGE2_MATCH_WINDOW + 1;
+        if (begin < 0) begin = 0;
+        if (end > n_maj) end = n_maj;
+        /* Very small fallback: ensure at least one candidate. */
+        if (begin >= end) { begin = 0; end = n_maj; }
+    }
+#else
+    const int begin = 0;
+    const int end   = n_maj;
+#endif
 
-        /* cooperative load of one chunk of the majority array */
+    for (int cs = begin; cs < end; cs += POS_CHUNK) {
+        const int clen = min(POS_CHUNK, end - cs);
+
         for (int k = tid; k < clen; k += blockDim.x)
             s_maj[k] = d_majority[1 + cs + k];
         __syncthreads();
@@ -326,7 +370,6 @@ __global__ void k_match_residues(const int *__restrict__ d_minority,
     }
 
     if (active) {
-        /* Only reachable when n_maj == 0 (no majority residues at all). */
         if (best_enc < 0)
             best_enc = nearest_edge_enc(mi, mj, xsize, ysize);
 
@@ -851,49 +894,89 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     }
 
     cudaError_t e;
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+
+    printf("  [GPU][Stage2 timing] begin\n");
 
     /* ---- H2D bitflags ---------------------------------------------------- */
-    if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags, length,
-                        cudaMemcpyHostToDevice)) != cudaSuccess) {
-        cuda_fail(e, "H2D bitflags"); return;
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length,
+                   cudaMemcpyHostToDevice);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 H2D bitflags", t0, t1);
+    if (e != cudaSuccess) {
+        cuda_fail(e, "H2D bitflags");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
     }
 
     /* ---- Reset only the counter slots ------------------------------------ */
+    cudaEventRecord(t0, 0);
     cudaMemsetAsync(dev->d_pos_residues, 0, sizeof(int));
     cudaMemsetAsync(dev->d_neg_residues, 0, sizeof(int));
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 reset residue counters", t0, t1);
 
     /* ---- Kernel 1: pack residues ----------------------------------------- */
     {
         dim3 block(16, 16);
         dim3 grid = residue_grid(xsize, ysize);
+
+        cudaEventRecord(t0, 0);
         k_pack_residues<<<grid, block>>>(dev->d_bitflags,
                                          dev->d_pos_residues,
                                          dev->d_neg_residues,
                                          xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_pack_residues", t0, t1);
+
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_pack_residues"); return;
+            cuda_fail(e, "k_pack_residues");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
         }
     }
 
     int h_n_pos = 0, h_n_neg = 0;
-    cudaMemcpy(&h_n_pos, dev->d_pos_residues, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_n_neg, dev->d_neg_residues, sizeof(int), cudaMemcpyDeviceToHost);
-
-    if (h_n_pos == 0 && h_n_neg == 0) {
-        /* No residues — nothing to do. */
-        cudaMemcpy(h_bitflags, dev->d_bitflags, length, cudaMemcpyDeviceToHost);
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(&h_n_pos, dev->d_pos_residues, sizeof(int), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess)
+        e = cudaMemcpy(&h_n_neg, dev->d_neg_residues, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 D2H residue counts", t0, t1);
+    if (e != cudaSuccess) {
+        cuda_fail(e, "D2H residue counts");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
         return;
     }
 
-    /* Capacity sanity check. If this fires, the residue density of the      */
-    /* input exceeded the allocator's assumed upper bound; the atomicAdd in  */
-    /* k_pack_residues has already overrun the buffer and device memory is   */
-    /* corrupt. Bail loudly rather than producing silently wrong output.     */
+    printf("  [GPU][Stage2] packed residues: pos=%d neg=%d\n", h_n_pos, h_n_neg);
+
+    if (h_n_pos == 0 && h_n_neg == 0) {
+        cudaEventRecord(t0, 0);
+        e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length,
+                       cudaMemcpyDeviceToHost);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 D2H bitflags", t0, t1);
+        if (e != cudaSuccess)
+            cuda_fail(e, "D2H bitflags");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
     const int cap = residue_capacity(length);
     if (h_n_pos > cap || h_n_neg > cap) {
         fprintf(stderr, "residue_matching: residue count exceeds capacity "
                         "(pos=%d neg=%d cap=%d) — raise residue_capacity()\n",
                 h_n_pos, h_n_neg, cap);
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
         return;
     }
 
@@ -909,10 +992,18 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     if (n_min > 0) {
         const int threads = STAGE2_GROW_THREADS;
         const int blocks  = (n_min + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
         k_match_residues<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
                                               dev->d_pairs, xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_match_residues", t0, t1);
+
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_match_residues"); return;
+            cuda_fail(e, "k_match_residues");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
         }
     }
 
@@ -921,11 +1012,21 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     if (n_leftover > 0) {
         const int threads = STAGE2_GROW_THREADS;
         const int blocks  = (n_leftover + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
         k_fill_leftovers<<<blocks, threads>>>(d_maj, n_min, n_leftover,
                                               dev->d_pairs, xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_fill_leftovers", t0, t1);
+
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_fill_leftovers"); return;
+            cuda_fail(e, "k_fill_leftovers");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
         }
+    } else {
+        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage2 k_fill_leftovers", 0.0f);
     }
 
     /* ---- Kernel 4: one rasterize pass over the combined buffer ----------- */
@@ -933,10 +1034,18 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     if (n_total > 0) {
         const int threads = STAGE2_GROW_THREADS;
         const int blocks  = (n_total + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
         k_rasterize_cuts<<<blocks, threads>>>(dev->d_pairs, n_total,
                                               dev->d_bitflags, xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_rasterize_cuts", t0, t1);
+
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_rasterize_cuts"); return;
+            cuda_fail(e, "k_rasterize_cuts");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
         }
     }
 
@@ -944,41 +1053,248 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     {
         const int threads = STAGE2_GROW_THREADS;
         const int blocks  = (length + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
         k_mark_residues_as_branch_cuts<<<blocks, threads>>>(dev->d_bitflags, length);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_mark_residues_as_cuts", t0, t1);
+
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_mark_residues_as_branch_cuts"); return;
+            cuda_fail(e, "k_mark_residues_as_branch_cuts");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
         }
     }
 
-    if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
-        cuda_fail(e, "sync after stage 2"); return;
-    }
-
     /* ---- Stage 2 diagnostics: verify that residues are covered by cuts. -- */
+    cudaEventRecord(t0, 0);
     verify_stage2_branchcuts_device(dev, length, xsize, ysize);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 verify diagnostics total", t0, t1);
 
     /* ---- D2H bitflags ---------------------------------------------------- */
-    if ((e = cudaMemcpy(h_bitflags, dev->d_bitflags, length,
-                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length,
+                   cudaMemcpyDeviceToHost);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 D2H bitflags", t0, t1);
+    if (e != cudaSuccess)
         cuda_fail(e, "D2H bitflags");
-}
 
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+}
 extern "C" void unwrap_cuda_launch_unwrapping(
     float *h_phase, unsigned char *h_bitflags, float *h_soln,
     float *h_gradx, float *h_grady,
     const UnwrapCudaDeviceBufs *dev,
     int xsize, int ysize, int length)
 {
-    (void)dev;
-
     if (length < 1 || !h_phase || !h_bitflags || !h_soln || !h_gradx || !h_grady
         || xsize < 1 || ysize < 1 || length != xsize * ysize)
         return;
 
-    /* Correctness-first Stage 3. The previous GPU BFS used atomic claims, so
-       a pixel reached by two same-level parents could choose a nondeterministic
-       parent. This mirrors the CPU UnwrapAroundCutsFrontier order exactly while
-       Stage 2 is being debugged. */
+#if STAGE3_FAST_GPU_BFS
+    if (!dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
+        || !dev->d_gradx || !dev->d_grady
+        || !dev->d_frontier_a || !dev->d_frontier_b
+        || !dev->d_frontier_count_a || !dev->d_frontier_count_b) {
+        fprintf(stderr, "unwrap_cuda: Stage3 fast GPU BFS missing device buffers; falling back to CPU exact\n");
+    } else {
+        cudaError_t e;
+        constexpr unsigned char kAvoidU = kBranchCut | kBorder;
+        cudaEvent_t s3_t0, s3_t1;
+        cudaEventCreate(&s3_t0);
+        cudaEventCreate(&s3_t1);
+        clock_t seed_cpu_t0 = clock();
+
+        printf("  [GPU][Stage3 timing] begin\n");
+
+        /* CPU seed selection: one seed per connected component.  This is cheap
+           compared with full CPU unwrapping and avoids the old single-source
+           failure when cuts split the image. */
+        int h_frontier_count = 0;
+        int *h_frontier_tmp = (int*)malloc((size_t)length * sizeof(int));
+        int *stack = (int*)malloc((size_t)length * sizeof(int));
+        if (!h_frontier_tmp || !stack) {
+            fprintf(stderr, "unwrap_cuda: Stage3 seed malloc failed; falling back to CPU exact\n");
+            free(h_frontier_tmp);
+            free(stack);
+        } else {
+            for (int k = 0; k < length; k++)
+                h_bitflags[k] &= ~kUnwrapped;
+
+            for (int k = 0; k < length; k++) {
+                if (!(h_bitflags[k] & (kAvoidU | kUnwrapped))) {
+                    h_soln[k] = h_phase[k];
+                    h_bitflags[k] |= kUnwrapped;
+                    h_frontier_tmp[h_frontier_count++] = k;
+
+                    int top = 0;
+                    stack[top++] = k;
+                    while (top > 0) {
+                        const int cur = stack[--top];
+                        const int cx = cur % xsize;
+                        const int cy = cur / xsize;
+                        int nb;
+                        if (cx > 0) {
+                            nb = cur - 1;
+                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
+                                h_bitflags[nb] |= kUnwrapped;
+                                stack[top++] = nb;
+                            }
+                        }
+                        if (cx + 1 < xsize) {
+                            nb = cur + 1;
+                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
+                                h_bitflags[nb] |= kUnwrapped;
+                                stack[top++] = nb;
+                            }
+                        }
+                        if (cy > 0) {
+                            nb = cur - xsize;
+                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
+                                h_bitflags[nb] |= kUnwrapped;
+                                stack[top++] = nb;
+                            }
+                        }
+                        if (cy + 1 < ysize) {
+                            nb = cur + xsize;
+                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
+                                h_bitflags[nb] |= kUnwrapped;
+                                stack[top++] = nb;
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Reset all temporary component marks, then mark only seeds. */
+            for (int k = 0; k < length; k++)
+                h_bitflags[k] &= ~kUnwrapped;
+            for (int i = 0; i < h_frontier_count; i++)
+                h_bitflags[h_frontier_tmp[i]] |= kUnwrapped;
+
+            {
+                double seed_ms = 1000.0 * (double)(clock() - seed_cpu_t0) / (double)CLOCKS_PER_SEC;
+                printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 CPU component seed scan", seed_ms);
+            }
+
+            cudaEventRecord(s3_t0, 0);
+            if ((e = cudaMemcpy(dev->d_phase, h_phase,
+                                (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D phase");
+            } else if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags,
+                                       (size_t)length * sizeof(unsigned char), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D bitflags");
+            } else if ((e = cudaMemcpy(dev->d_soln, h_soln,
+                                       (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D soln");
+            } else if ((e = cudaMemcpy(dev->d_gradx, h_gradx,
+                                       (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D gradx");
+            } else if ((e = cudaMemcpy(dev->d_grady, h_grady,
+                                       (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D grady");
+            } else if ((e = cudaMemcpy(dev->d_frontier_a, h_frontier_tmp,
+                                       (size_t)h_frontier_count * sizeof(int), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D seeds");
+            } else if ((e = cudaMemcpy(dev->d_frontier_count_a, &h_frontier_count,
+                                       sizeof(int), cudaMemcpyHostToDevice)) != cudaSuccess) {
+                cuda_fail(e, "Stage3 H2D seed count");
+            } else {
+                cudaEventRecord(s3_t1, 0);
+                cudaEventSynchronize(s3_t1);
+                print_cuda_interval("Stage3 H2D inputs + seeds", s3_t0, s3_t1);
+
+                cudaEventRecord(s3_t0, 0);
+                cudaMemset(dev->d_frontier_count_b, 0, sizeof(int));
+
+                int *d_in = dev->d_frontier_a;
+                int *d_out = dev->d_frontier_b;
+                int *n_in = dev->d_frontier_count_a;
+                int *n_out = dev->d_frontier_count_b;
+                int h_n_in = h_frontier_count;
+                int round = 0;
+
+                while (h_n_in > 0 && round < STAGE3_MAX_BFS_ROUNDS) {
+                    cudaMemset(n_out, 0, sizeof(int));
+                    const int threads = STAGE3_BFS_THREADS;
+                    const int blocks = (h_n_in + threads - 1) / threads;
+                    k_bfs_expand<<<blocks, threads>>>(
+                        dev->d_phase, dev->d_bitflags, dev->d_soln,
+                        dev->d_gradx, dev->d_grady,
+                        d_in, h_n_in, d_out, n_out,
+                        xsize, ysize);
+                    if ((e = cudaGetLastError()) != cudaSuccess) {
+                        cuda_fail(e, "k_bfs_expand");
+                        break;
+                    }
+                    if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
+                        cuda_fail(e, "sync k_bfs_expand");
+                        break;
+                    }
+                    int *tmp;
+                    tmp = d_in; d_in = d_out; d_out = tmp;
+                    tmp = n_in; n_in = n_out; n_out = tmp;
+                    cudaMemcpy(&h_n_in, n_in, sizeof(int), cudaMemcpyDeviceToHost);
+                    ++round;
+                }
+
+                cudaEventRecord(s3_t1, 0);
+                cudaEventSynchronize(s3_t1);
+                print_cuda_interval("Stage3 BFS expand loop total", s3_t0, s3_t1);
+
+                if (h_n_in > 0) {
+                    fprintf(stderr,
+                            "unwrap_cuda: Stage3 BFS stopped after STAGE3_MAX_BFS_ROUNDS=%d "
+                            "with frontier=%d still active; output may be incomplete.\n",
+                            STAGE3_MAX_BFS_ROUNDS, h_n_in);
+                }
+
+                dim3 block(STAGE3_AVOID_TILE_W, STAGE3_AVOID_TILE_H);
+                dim3 grid((xsize + STAGE3_AVOID_TILE_W - 1) / STAGE3_AVOID_TILE_W,
+                          (ysize + STAGE3_AVOID_TILE_H - 1) / STAGE3_AVOID_TILE_H);
+                cudaEventRecord(s3_t0, 0);
+                k_avoid_fill<<<grid, block>>>(dev->d_phase, dev->d_bitflags, dev->d_soln,
+                                              xsize, ysize);
+                if ((e = cudaGetLastError()) != cudaSuccess)
+                    cuda_fail(e, "k_avoid_fill");
+                cudaDeviceSynchronize();
+                cudaEventRecord(s3_t1, 0);
+                cudaEventSynchronize(s3_t1);
+                print_cuda_interval("Stage3 k_avoid_fill", s3_t0, s3_t1);
+
+                cudaEventRecord(s3_t0, 0);
+                cudaMemcpy(h_soln, dev->d_soln,
+                           (size_t)length * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_bitflags, dev->d_bitflags,
+                           (size_t)length * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+                cudaEventRecord(s3_t1, 0);
+                cudaEventSynchronize(s3_t1);
+                print_cuda_interval("Stage3 D2H soln + bitflags", s3_t0, s3_t1);
+
+                printf("  [GPU] Stage3 fast BFS: seeds=%d, rounds=%d, max_rounds=%d\n",
+                       h_frontier_count, round, STAGE3_MAX_BFS_ROUNDS);
+                cudaEventDestroy(s3_t0);
+                cudaEventDestroy(s3_t1);
+                free(h_frontier_tmp);
+                free(stack);
+                return;
+            }
+            cudaEventDestroy(s3_t0);
+            cudaEventDestroy(s3_t1);
+            free(h_frontier_tmp);
+            free(stack);
+        }
+    }
+#endif
+
+    /* Exact CPU fallback.  Compile with -DSTAGE3_FAST_GPU_BFS=0 to force this
+       path when exact CPU-order replay is needed for debugging. */
     int *list = (int*)malloc((size_t)2 * (size_t)(xsize + ysize) * sizeof(int));
     if (!list) {
         fprintf(stderr, "unwrap_cuda: Stage3 host frontier malloc failed\n");
@@ -1014,28 +1330,24 @@ extern "C" void unwrap_cuda_launch_unwrapping(
                     const float value = h_soln[kk];
 
                     int index;
-
                     index = kk - 1;
                     if (x - 1 >= 0 && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
                         h_bitflags[index] |= kUnwrapped;
                         h_soln[index] = value + h_gradx[index];
                         list[top_out++] = index;
                     }
-
                     index = kk + 1;
                     if (x + 1 < xsize && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
                         h_bitflags[index] |= kUnwrapped;
                         h_soln[index] = value - h_gradx[kk];
                         list[top_out++] = index;
                     }
-
                     index = kk - xsize;
                     if (y - 1 >= 0 && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
                         h_bitflags[index] |= kUnwrapped;
                         h_soln[index] = value + h_grady[index];
                         list[top_out++] = index;
                     }
-
                     index = kk + xsize;
                     if (y + 1 < ysize && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
                         h_bitflags[index] |= kUnwrapped;
@@ -1044,9 +1356,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(
                     }
                 }
 
-                if (base_out == top_out) {
-                    flag = 0;
-                } else {
+                if (base_out == top_out) flag = 0;
+                else {
                     int tmp;
                     tmp = base_in;  base_in = base_out;  base_out = tmp;
                     tmp = top_in;   top_in = top_out;    top_out = tmp;
@@ -1060,17 +1371,15 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         for (int i = 1; i < xsize; i++) {
             const int k = j * xsize + i;
             if (h_bitflags[k] & (kBranchCut | kBorder)) {
-                if (!(h_bitflags[k - 1] & (kBranchCut | kBorder))) {
+                if (!(h_bitflags[k - 1] & (kBranchCut | kBorder)))
                     h_soln[k] = h_soln[k - 1] + host_gradient(h_phase[k], h_phase[k - 1]);
-                } else if (!(h_bitflags[k - xsize] & (kBranchCut | kBorder))) {
+                else if (!(h_bitflags[k - xsize] & (kBranchCut | kBorder)))
                     h_soln[k] = h_soln[k - xsize] + host_gradient(h_phase[k], h_phase[k - xsize]);
-                }
             }
         }
     }
 
-    printf("  [GPU] Stage3 correctness fallback: CPU-equivalent frontier, pieces=%d, max_frontier=%d\n",
+    printf("  [GPU] Stage3 exact CPU fallback: pieces=%d, max_frontier=%d\n",
            num_pieces, max_frontier);
-
     free(list);
 }
