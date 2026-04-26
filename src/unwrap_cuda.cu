@@ -116,6 +116,14 @@ __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
 constexpr unsigned char kUnwrapped  = 0x40;
 constexpr unsigned char kAvoid      = kBranchCut | kBorder;
 
+__device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
+{
+    unsigned int *word = (unsigned int *)(flags + (idx & ~3));
+    unsigned int bit = (unsigned int)kUnwrapped << ((idx & 3) * 8);
+    unsigned int old = atomicOr(word, bit);
+    return !(old & bit);
+}
+
 __global__ void k_init_seeds(const float        *phase,
                               unsigned char      *bitflags,
                               float              *soln,
@@ -144,6 +152,78 @@ __global__ void k_init_seeds(const float        *phase,
  * Unwrapped neighbors are pushed into d_out via atomicAdd on *n_out.
  * ----------------------------------------------------------------------- */
 __global__ void k_bfs_expand(const float        *phase,
+//                               unsigned char      *bitflags,
+//                               float              *soln,
+//                               const float        *gradx,
+//                               const float        *grady,
+//                               const int          *d_in,
+//                               int                 n_in,
+//                               int                *d_out,
+//                               int                *n_out,
+//                               int                 xsize,
+//                               int                 ysize)
+// {
+//     const int t  = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (t >= n_in) return;
+
+//     const int kk    = d_in[t];
+//     const int x     = kk % xsize;
+//     const int y     = kk / xsize;
+//     const float val = soln[kk];
+//     atomicOr((unsigned int*)(bitflags) + (kk>>2),
+//          (unsigned int)kUnwrapped << ((kk&3)*8));
+
+//     /* left */
+//     if (x - 1 >= 0) {
+//         const int nb = kk - 1;
+//         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+//             if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
+//                            (unsigned int)kUnwrapped << ((nb&3)*8))
+//                   & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+//                 soln[nb] = val + gradx[nb];
+//                 d_out[atomicAdd(n_out, 1)] = nb;
+//             }
+//         }
+//     }
+//     /* right */
+//     if (x + 1 < xsize) {
+//         const int nb = kk + 1;
+//         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+//             if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
+//                            (unsigned int)kUnwrapped << ((nb&3)*8))
+//                   & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+//                 soln[nb] = val - gradx[kk];
+//                 d_out[atomicAdd(n_out, 1)] = nb;
+//             }
+//         }
+//     }
+//     /* up */
+//     if (y - 1 >= 0) {
+//         const int nb = kk - xsize;
+//         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+//             if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
+//                            (unsigned int)kUnwrapped << ((nb&3)*8))
+//                   & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+//                 soln[nb] = val + grady[nb];
+//                 d_out[atomicAdd(n_out, 1)] = nb;
+//             }
+//         }
+//     }
+//     /* down */
+//     if (y + 1 < ysize) {
+//         const int nb = kk + xsize;
+//         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+//             if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
+//                            (unsigned int)kUnwrapped << ((nb&3)*8))
+//                   & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+//                 soln[nb] = val - grady[kk];
+//                 d_out[atomicAdd(n_out, 1)] = nb;
+//             }
+//         }
+//     }
+// }
+
+__global__ void k_bfs_expand(const float        *phase,
                               unsigned char      *bitflags,
                               float              *soln,
                               const float        *gradx,
@@ -155,23 +235,19 @@ __global__ void k_bfs_expand(const float        *phase,
                               int                 xsize,
                               int                 ysize)
 {
-    const int t  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_in) return;
 
-    const int kk    = d_in[t];
-    const int x     = kk % xsize;
-    const int y     = kk / xsize;
+    const int kk  = d_in[t];
+    const int x   = kk % xsize;
+    const int y   = kk / xsize;
     const float val = soln[kk];
-    atomicOr((unsigned int*)(bitflags) + (kk>>2),
-         (unsigned int)kUnwrapped << ((kk&3)*8));
 
     /* left */
     if (x - 1 >= 0) {
         const int nb = kk - 1;
         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
-                           (unsigned int)kUnwrapped << ((nb&3)*8))
-                  & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+            if (claim_pixel(bitflags, nb)) {
                 soln[nb] = val + gradx[nb];
                 d_out[atomicAdd(n_out, 1)] = nb;
             }
@@ -181,9 +257,7 @@ __global__ void k_bfs_expand(const float        *phase,
     if (x + 1 < xsize) {
         const int nb = kk + 1;
         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
-                           (unsigned int)kUnwrapped << ((nb&3)*8))
-                  & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+            if (claim_pixel(bitflags, nb)) {
                 soln[nb] = val - gradx[kk];
                 d_out[atomicAdd(n_out, 1)] = nb;
             }
@@ -193,9 +267,7 @@ __global__ void k_bfs_expand(const float        *phase,
     if (y - 1 >= 0) {
         const int nb = kk - xsize;
         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
-                           (unsigned int)kUnwrapped << ((nb&3)*8))
-                  & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+            if (claim_pixel(bitflags, nb)) {
                 soln[nb] = val + grady[nb];
                 d_out[atomicAdd(n_out, 1)] = nb;
             }
@@ -205,9 +277,7 @@ __global__ void k_bfs_expand(const float        *phase,
     if (y + 1 < ysize) {
         const int nb = kk + xsize;
         if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (!(atomicOr((unsigned int*)(bitflags) + (nb>>2),
-                           (unsigned int)kUnwrapped << ((nb&3)*8))
-                  & ((unsigned int)kUnwrapped << ((nb&3)*8)))) {
+            if (claim_pixel(bitflags, nb)) {
                 soln[nb] = val - grady[kk];
                 d_out[atomicAdd(n_out, 1)] = nb;
             }
@@ -476,7 +546,7 @@ static dim3 residue_grid(int xsize, int ysize)
 
 static inline int residue_capacity(int length)
 {
-    return length / 5 + 4;
+    return length + 1;
 }
 
 } /* namespace */
@@ -505,7 +575,8 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
     e = cudaMalloc((void **)&out->d_phase, (size_t)length * sizeof(float));
     if (e != cudaSuccess)
         return (int)e;
-    e = cudaMalloc((void **)&out->d_bitflags, (size_t)length * sizeof(unsigned char));
+    const size_t bitflag_bytes = ((size_t)length + 3u) & ~(size_t)3u;
+    e = cudaMalloc((void **)&out->d_bitflags, bitflag_bytes);
     if (e != cudaSuccess) {
         unwrap_cuda_device_bufs_free(out);
         return (int)e;
@@ -776,14 +847,36 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int h_frontier_count = 0;
     int *h_frontier_tmp = (int*)malloc((size_t)length * sizeof(int));
 
-    for (int k = 0; k < length; k++) {
-        if (!(h_bitflags[k] & (kAvoidU | kUnwrapped))) {
-            h_soln[k] = h_phase[k];
-            // h_bitflags[k] |= kUnwrapped;
-            h_frontier_tmp[h_frontier_count++] = k;
+    // Find one seed per connected component
+for (int k = 0; k < length; k++) {
+    if (!(h_bitflags[k] & (kAvoidU | kUnwrapped))) {
+        h_soln[k] = h_phase[k];
+        h_bitflags[k] |= kUnwrapped;
+        h_frontier_tmp[h_frontier_count++] = k;
+
+        // flood-fill to mark rest of this component so outer loop skips them
+        int *stk = (int*)malloc((size_t)length * sizeof(int));
+        int top = 0;
+        stk[top++] = k;
+        while (top > 0) {
+            int cur = stk[--top];
+            int cx = cur % xsize, cy = cur / xsize;
+            int nb;
+            if (cx > 0)        { nb = cur-1;      if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
+            if (cx < xsize-1)  { nb = cur+1;      if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
+            if (cy > 0)        { nb = cur-xsize;  if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
+            if (cy < ysize-1)  { nb = cur+xsize;  if (!(h_bitflags[nb] & (kAvoidU|kUnwrapped))) { h_bitflags[nb] |= kUnwrapped; stk[top++] = nb; } }
         }
+        free(stk);
     }
-    // printf("  [GPU] frontier seed count: %d / %d pixels\n", h_frontier_count, length);
+}
+
+// Reset kUnwrapped everywhere, then re-mark only seeds
+for (int k = 0; k < length; k++)
+    h_bitflags[k] &= ~kUnwrapped;
+for (int i = 0; i < h_frontier_count; i++)
+    h_bitflags[h_frontier_tmp[i]] |= kUnwrapped;
+    printf("  [GPU] frontier seed count: %d / %d pixels\n", h_frontier_count, length);
 
     /* H2D transfers — after CPU seeding so bitflags/soln are updated */
     cudaMemcpy(dev->d_phase,    h_phase,    (size_t)length * sizeof(float),         cudaMemcpyHostToDevice);
@@ -824,7 +917,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         cudaMemcpy(&h_n_in, n_in, sizeof(int), cudaMemcpyDeviceToHost);
         ++round;
     }
-    // printf("  [GPU] BFS unwrap: %d rounds\n", round);
+    printf("  [GPU] BFS unwrap: %d rounds\n", round);
 
     /* AVOID-band fill */
     {
@@ -841,4 +934,19 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     /* D2H */
     cudaMemcpy(h_soln,     dev->d_soln,     (size_t)length * sizeof(float),         cudaMemcpyDeviceToHost);
     cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+
+    {
+        int truly_bad = 0, twopi_off = 0;
+        float twopi = 2.0f * 3.14159265f;
+        for (int k = 0; k < length; k++) {
+            if (!(h_bitflags[k] & kUnwrapped)) continue;
+            float diff = h_soln[k] - h_phase[k];
+            float mod = fmodf(fabsf(diff), twopi);
+            if (mod > 0.01f && mod < twopi - 0.01f)
+                truly_bad++;
+            else
+                twopi_off++;
+        }
+        printf("  [GPU] truly_bad=%d  twopi_multiple_off=%d\n", truly_bad, twopi_off);
+    }
 }
