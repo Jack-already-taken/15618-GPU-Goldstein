@@ -1388,9 +1388,11 @@ static void run_unwrap_kernel_cuda(
     /* Stage 3: unwrap on the GPU (tile-frontier or block-wise per build flag). */
     if (have_device) {
         ta = clock();
-        unwrap_cuda_launch_unwrapping(ctx->phase, ctx->bitflags, ctx->soln,
-                                      &ctx->cuda_dev,
-                                      ctx->xsize, ctx->ysize, ctx->length);
+        unwrap_cuda_launch_unwrapping(
+            ctx->phase, ctx->bitflags, ctx->soln,
+            ctx->gradx, ctx->grady,
+            &ctx->cuda_dev,
+            ctx->xsize, ctx->ysize, ctx->length);
         tb = clock();
         out->ms_unwrap = timediff(ta, tb);
         /* The CUDA unwrap path does not enumerate connected components the way

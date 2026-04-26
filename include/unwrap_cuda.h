@@ -17,6 +17,13 @@ typedef struct UnwrapCudaDeviceBufs {
     
     float          *d_soln;
     int            *d_residue_count;
+    // Stage 3: Unwrapping
+    float          *d_gradx;
+    float          *d_grady;
+    int            *d_frontier_a;
+    int            *d_frontier_b;
+    int            *d_frontier_count_a;
+    int            *d_frontier_count_b;
 } UnwrapCudaDeviceBufs;
 
 /**
@@ -52,13 +59,16 @@ void unwrap_cuda_launch_residue_matching(unsigned char               *h_bitflags
                                          int                        length);
 
 
-void unwrap_cuda_launch_unwrapping(float                 *h_phase,
-                                   unsigned char         *h_bitflags,
-                                   float                 *h_soln,
+void unwrap_cuda_launch_unwrapping(float                      *h_phase,
+                                   unsigned char              *h_bitflags,
+                                   float                      *h_soln,
+                                   float                      *h_gradx,
+                                   float                      *h_grady,
                                    const UnwrapCudaDeviceBufs *dev,
-                                   int                    xsize,
-                                   int                    ysize,
-                                   int                    length);
+                                   int                         xsize,
+                                   int                         ysize,
+                                   int                         length);
+
 
 #ifdef __cplusplus
 }
