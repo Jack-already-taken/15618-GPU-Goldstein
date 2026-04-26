@@ -1172,6 +1172,44 @@ static int count_flag_mismatch(const unsigned char *a, const unsigned char *b,
 }
 
 
+/* Count pixels containing a selected flag bit. */
+static int count_flag_pixels(const unsigned char *bf, int n, unsigned char mask)
+{
+    int k, c = 0;
+    if (!bf)
+        return 0;
+    for (k = 0; k < n; k++)
+        if (bf[k] & mask)
+            ++c;
+    return c;
+}
+
+/* Count branch-cut pixels that touch the image border.
+ * This catches a common broken Stage-2 behavior where most residues fall back
+ * to rim connection instead of neutralizing into local clusters.
+ */
+static int count_border_touching_cuts(const unsigned char *bf, int xsize, int ysize)
+{
+    int x, y, c = 0;
+    if (!bf || xsize <= 0 || ysize <= 0)
+        return 0;
+
+    for (x = 0; x < xsize; x++) {
+        if (bf[x] & BRANCH_CUT)
+            ++c;
+        if (ysize > 1 && (bf[(ysize - 1) * xsize + x] & BRANCH_CUT))
+            ++c;
+    }
+    for (y = 1; y < ysize - 1; y++) {
+        if (bf[y * xsize] & BRANCH_CUT)
+            ++c;
+        if (xsize > 1 && (bf[y * xsize + xsize - 1] & BRANCH_CUT))
+            ++c;
+    }
+    return c;
+}
+
+
 /* Compare two unwrapped solutions (radians). */
 static void soln_diff_stats(const float *a, const float *b, int n,
                             double *max_abs, int *n_gt_tol, float tol)
@@ -1497,13 +1535,16 @@ double goldstein_phase_unwrapping(const char *input_path,
     char           fname[PATH_MAX];
     int            k, length, num_pieces, NumRes, MaxCutLen;
     int            *list;
-    int            mis_res = 0, mis_brc = 0, n_soln_bad = 0, saved_nc = 0;
-    double         soln_max_abs = 0.0;
+    int            mis_res = 0, mis_brc = 0, mis_brc_cpu_1t = 0;
+    int            n_soln_bad = 0, n_soln_bad_gold = 0, saved_nc = 0;
+    int            branch_cuda = 0, branch_cpu = 0;
+    int            border_cuda = 0, border_cpu = 0;
+    double         soln_max_abs = 0.0, soln_max_abs_gold = 0.0;
     unsigned char *bf_res_ser = NULL, *bf_brc_ser = NULL, *bf_brc_1t = NULL;
-    unsigned char *bf_preunwrap = NULL, *bf_unwrap2 = NULL;
+    unsigned char *bf_preunwrap = NULL, *bf_unwrap2 = NULL, *bf_gold = NULL;
     unsigned char *snap_after_res = NULL;
-    float          *soln_ser = NULL;
-    int            *path_order_ser = NULL;
+    float          *soln_ser = NULL, *soln_gold = NULL;
+    int            *path_order_ser = NULL, *path_order_gold = NULL;
 
     int is_tiff = is_tiff_path(input_path);
     int verify_effective;
@@ -1664,6 +1705,8 @@ double goldstein_phase_unwrapping(const char *input_path,
 
     if (verify_effective) {
         _t0 = clock();
+
+        /* 1) Verify Stage 1 residue flags against CPU serial residue pass. */
         bf_res_ser = (unsigned char *)malloc((size_t)length);
         if (bf_res_ser && snap_after_res) {
             for (k = 0; k < length; k++)
@@ -1675,12 +1718,31 @@ double goldstein_phase_unwrapping(const char *input_path,
         free(bf_res_ser);
         bf_res_ser = NULL;
 
+        /* 2) Build CPU serial branch-cut reference from post-residue snapshot.
+         * Compare backend/CUDA Stage 2 output (bf_preunwrap) directly against it.
+         */
         bf_brc_ser = (unsigned char *)malloc((size_t)length);
         bf_brc_1t = (unsigned char *)malloc((size_t)length);
-        if (bf_brc_ser && bf_brc_1t && snap_after_res) {
+        if (bf_brc_ser && snap_after_res) {
             memcpy(bf_brc_ser, snap_after_res, (size_t)length);
             GoldsteinBranchCuts_serial(bf_brc_ser, MaxCutLen, NumRes, xsize, ysize);
 
+            branch_cpu = count_flag_pixels(bf_brc_ser, length, BRANCH_CUT);
+            border_cpu = count_border_touching_cuts(bf_brc_ser, xsize, ysize);
+
+            if (bf_preunwrap) {
+                mis_brc = count_flag_mismatch(
+                    bf_preunwrap, bf_brc_ser, length,
+                    (unsigned char)(BRANCH_CUT | BORDER | POS_RES | NEG_RES));
+                branch_cuda = count_flag_pixels(bf_preunwrap, length, BRANCH_CUT);
+                border_cuda = count_border_touching_cuts(bf_preunwrap, xsize, ysize);
+            }
+        }
+
+        /* Optional CPU-reference sanity: parallel@1 should match CPU serial.
+         * This is not a CUDA Stage-2 check; it only validates CPU reference setup.
+         */
+        if (bf_brc_ser && bf_brc_1t && snap_after_res) {
             memcpy(bf_brc_1t, snap_after_res, (size_t)length);
             saved_nc = NUM_CORES;
             NUM_CORES = 1;
@@ -1689,15 +1751,12 @@ double goldstein_phase_unwrapping(const char *input_path,
             NUM_CORES = saved_nc;
             omp_set_num_threads(NUM_CORES);
 
-            mis_brc = count_flag_mismatch(
+            mis_brc_cpu_1t = count_flag_mismatch(
                 bf_brc_1t, bf_brc_ser, length,
                 (unsigned char)(BRANCH_CUT | BORDER | POS_RES | NEG_RES));
         }
-        free(bf_brc_ser);
-        bf_brc_ser = NULL;
-        free(bf_brc_1t);
-        bf_brc_1t = NULL;
 
+        /* 3) Stage-3-only check: CPU unwrap replay on backend branch cuts. */
         if (bf_preunwrap && bf_unwrap2 && soln_ser && path_order_ser) {
             memset(soln_ser, 0, (size_t)length * sizeof(float));
             memset(path_order_ser, 0, (size_t)length * sizeof(int));
@@ -1705,19 +1764,64 @@ double goldstein_phase_unwrapping(const char *input_path,
             UnwrapAroundCutsFrontier(phase, bf_unwrap2, soln_ser,
                                      xsize, ysize, path_order_ser,
                                      grady, gradx, list, length, 0);
-            soln_diff_stats(soln, soln_ser, length, &soln_max_abs, &n_soln_bad, 1e-5f);
-
-            printf("\n=== Correctness (--verify-serial; backend=%s) ===\n",
-                   g_unwrap_backend_names[unwrap_backend]);
-            printf("  Residues (POS|NEG) : %s  (%d mismatched cells)\n",
-                   mis_res ? "CHECK" : "PASS", mis_res);
-            printf("  Branch layout      : %s  (%d mismatched cells; "
-                   "GoldsteinBranchCuts_serial vs parallel@1 thread)\n",
-                   mis_brc ? "CHECK" : "PASS", mis_brc);
-            printf("  Unwrap (kernel vs serial AVOID replay) : %s  "
-                   "(max |Δ| = %.6g, cells > 1e-5: %d)\n",
-                   n_soln_bad ? "CHECK" : "PASS", soln_max_abs, n_soln_bad);
+            soln_diff_stats(soln, soln_ser, length,
+                            &soln_max_abs, &n_soln_bad, 1e-5f);
         }
+
+        /* 4) Full-pipeline check against CPU serial Stage2 + CPU unwrap.
+         * This catches bad Stage-2 topology even if Stage 3 is correct under the
+         * same wrong branch cuts.
+         */
+        if (bf_brc_ser) {
+            bf_gold = (unsigned char *)malloc((size_t)length);
+            soln_gold = (float *)malloc((size_t)length * sizeof(float));
+            path_order_gold = (int *)malloc((size_t)length * sizeof(int));
+            if (bf_gold && soln_gold && path_order_gold) {
+                memset(soln_gold, 0, (size_t)length * sizeof(float));
+                memset(path_order_gold, 0, (size_t)length * sizeof(int));
+                memcpy(bf_gold, bf_brc_ser, (size_t)length);
+                UnwrapAroundCutsFrontier(phase, bf_gold, soln_gold,
+                                         xsize, ysize, path_order_gold,
+                                         grady, gradx, list, length, 0);
+                soln_diff_stats(soln, soln_gold, length,
+                                &soln_max_abs_gold, &n_soln_bad_gold, 1e-5f);
+            } else {
+                fprintf(stderr,
+                        "verify_serial: malloc failed (gold reference buffers)\n");
+            }
+            free(bf_gold);
+            free(soln_gold);
+            free(path_order_gold);
+            bf_gold = NULL;
+            soln_gold = NULL;
+            path_order_gold = NULL;
+        }
+
+        printf("\n=== Correctness (--verify-serial; backend=%s) ===\n",
+               g_unwrap_backend_names[unwrap_backend]);
+        printf("  Residues (POS|NEG)                  : %s  (%d mismatched cells)\n",
+               mis_res ? "CHECK" : "PASS", mis_res);
+        printf("  Branch layout backend vs CPU serial : %s  (%d mismatched cells)\n",
+               mis_brc ? "CHECK" : "PASS", mis_brc);
+        printf("  Branch layout CPU parallel@1 vs serial: %s  (%d mismatched cells)\n",
+               mis_brc_cpu_1t ? "CHECK" : "PASS", mis_brc_cpu_1t);
+        printf("  Branch pixels backend / CPU serial  : %d / %d\n",
+               branch_cuda, branch_cpu);
+        printf("  Border-touching cuts backend / CPU  : %d / %d\n",
+               border_cuda, border_cpu);
+        printf("  Stage3 only, kernel vs CPU replay on backend cuts : %s  "
+               "(max |Delta| = %.6g, cells > 1e-5: %d)\n",
+               n_soln_bad ? "CHECK" : "PASS", soln_max_abs, n_soln_bad);
+        printf("  Full pipeline vs CPU serial Stage2+unwrap : %s  "
+               "(max |Delta| = %.6g, cells > 1e-5: %d)\n",
+               n_soln_bad_gold ? "CHECK" : "PASS",
+               soln_max_abs_gold, n_soln_bad_gold);
+
+        free(bf_brc_ser);
+        bf_brc_ser = NULL;
+        free(bf_brc_1t);
+        bf_brc_1t = NULL;
+
         _t1 = clock();
         ms_verify = timediff(_t0, _t1);
     }
