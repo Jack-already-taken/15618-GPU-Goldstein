@@ -15,6 +15,7 @@ namespace {
 constexpr unsigned char kUnwrapped  = 0x40;
 
 enum : unsigned char { kPosRes = 0x01, kNegRes = 0x02, kBorder = 0x20, kBranchCut = 0x10 };
+constexpr unsigned char kAvoid = kBranchCut | kBorder;
 
 __device__ __forceinline__ float device_gradient(float p1, float p2)
 {
