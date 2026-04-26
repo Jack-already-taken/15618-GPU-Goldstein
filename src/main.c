@@ -29,6 +29,8 @@
 #define POSTPONED   0x80   /* 8th bit */
 #define RESIDUE     (POS_RES | NEG_RES)
 #define AVOID       (BRANCH_CUT | BORDER)
+#define UNWRAP_BACKEND_CUDA_TILED   3
+#define UNWRAP_BACKEND_COUNT        4
 
 int NUM_CORES;
 
@@ -1206,7 +1208,7 @@ static void soln_diff_stats(const float *a, const float *b, int n,
 #define UNWRAP_BACKEND_PARALLEL_CPU 0
 #define UNWRAP_BACKEND_SERIAL_CPU   1
 #define UNWRAP_BACKEND_CUDA_STUB    2
-#define UNWRAP_BACKEND_COUNT        3
+
 
 typedef struct UnwrapKernelCtx {
     float                 *phase;
@@ -1294,6 +1296,8 @@ static void run_unwrap_kernel_parallel_cpu(
 //     out->elapsed_ms = timediff(t1, t2);
 // }
 
+
+
 static void run_unwrap_kernel_serial_cpu(
     UnwrapKernelCtx *ctx,
     int verify_effective,
@@ -1306,31 +1310,28 @@ static void run_unwrap_kernel_serial_cpu(
 
     t_total_start = clock();
 
-    /* Stage 1 */
-    t1 = clock();
-    out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
-                                        ctx->xsize, ctx->ysize);
-    t2 = clock();
-    printf("  [CPU serial] stage 1 residue: %.4f ms\n", timediff(t1, t2));
+    double ws1 = omp_get_wtime();
+    out->num_residues = Residues_serial(ctx->phase, ctx->bitflags, ctx->xsize, ctx->ysize);
+    double ws2 = omp_get_wtime();
+    printf("  [CPU serial] stage 1 residue: %.4f ms\n", (ws2-ws1)*1000.0);
 
     /* Stage 2 */
-    t1 = clock();
-    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
-                               out->num_residues, ctx->xsize, ctx->ysize);
-    t2 = clock();
-    printf("  [CPU serial] stage 2 branch cuts: %.4f ms\n", timediff(t1, t2));
+    double wb1 = omp_get_wtime();
+    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen, out->num_residues, ctx->xsize, ctx->ysize);
+    double wb2 = omp_get_wtime();
+    printf("  [CPU serial] stage 2 branch cuts: %.4f ms\n", (wb2-wb1)*1000.0);
 
     /* Stage 3 */
-    t1 = clock();
+   double wu1 = omp_get_wtime();
     out->num_pieces = UnwrapAroundCutsFrontier(
         ctx->phase, ctx->bitflags, ctx->soln,
         ctx->xsize, ctx->ysize, ctx->path_order,
         ctx->grady, ctx->gradx, ctx->list, ctx->length, 0);
-    t2 = clock();
-    printf("  [CPU serial] stage 3 unwrap: %.4f ms\n", timediff(t1, t2));
+    double wu2 = omp_get_wtime();
+    printf("  [CPU serial] stage 3 unwrap: %.4f ms\n", (wu2-wu1)*1000.0);
 
     /* Total */
-    out->elapsed_ms = timediff(t_total_start, t2);
+    out->elapsed_ms = (wu2 - ws1) * 1000.0;
 }
 
 static void run_unwrap_kernel_cuda(
@@ -1346,7 +1347,7 @@ static void run_unwrap_kernel_cuda(
     t_total_start = clock();
 
     /* Stage 1 */
-    t1 = clock();
+    double ws1 = omp_get_wtime();
     if (ctx->cuda_dev.d_phase && ctx->cuda_dev.d_bitflags) {
         out->num_residues = unwrap_cuda_launch_residue_identification(
             ctx->phase, ctx->bitflags, &ctx->cuda_dev,
@@ -1356,46 +1357,100 @@ static void run_unwrap_kernel_cuda(
         out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
                                             ctx->xsize, ctx->ysize);
     }
-    t2 = clock();
-    printf("  [CUDA] stage 1 residue wall time: %.4f ms\n", timediff(t1, t2));
+    double ws2 = omp_get_wtime();
+    printf("  [CUDA] stage 1 residue wall time: %.4f ms\n", (ws2-ws1)*1000.0);
 
     if (verify_effective && snap_after_res)
         memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
 
     /* Stage 2 */
-    t1 = clock();
+    double wb1 = omp_get_wtime();
     GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
                                out->num_residues, ctx->xsize, ctx->ysize);
-    t2 = clock();
-    printf("  [CUDA] stage 2 branch cuts wall time: %.4f ms\n", timediff(t1, t2));
-
+    double wb2 = omp_get_wtime();
+    printf("  [CUDA] stage 2 branch cuts wall time: %.4f ms\n", (wb2-wb1)*1000.0);
     if (verify_effective && bf_preunwrap)
         memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
 
     /* Stage 3 */
-    t1 = clock();
+    double wu1 = omp_get_wtime();
     unwrap_cuda_launch_unwrapping(
         ctx->phase, ctx->bitflags, ctx->soln,
         ctx->gradx, ctx->grady,
         &ctx->cuda_dev,
         ctx->xsize, ctx->ysize, ctx->length);
+    double wu2 = omp_get_wtime();
+    printf("  [CUDA] stage 3 unwrap wall time: %.4f ms\n", (wu2-wu1)*1000.0);
     t2 = clock();
-    printf("  [CUDA] stage 3 unwrap wall time: %.4f ms\n", timediff(t1, t2));
     out->num_pieces = 1;
 
-    out->elapsed_ms = timediff(t_total_start, t2);
+    out->elapsed_ms = (wu2 - ws1) * 1000.0;
+}
+
+static void run_unwrap_kernel_cuda_tiled(
+    UnwrapKernelCtx *ctx,
+    int verify_effective,
+    unsigned char *snap_after_res,
+    unsigned char *bf_preunwrap,
+    UnwrapKernelResult *out)
+{
+    clock_t t_total_start, t1, t2;
+    int MaxCutLen = (ctx->xsize + ctx->ysize) / 2;
+
+    t_total_start = clock();
+
+    /* Stage 1 —  */
+    double ws1 = omp_get_wtime();
+    if (ctx->cuda_dev.d_phase && ctx->cuda_dev.d_bitflags) {
+        out->num_residues = unwrap_cuda_launch_residue_identification(
+            ctx->phase, ctx->bitflags, &ctx->cuda_dev,
+            ctx->xsize, ctx->ysize, ctx->length);
+    } else {
+        out->num_residues = Residues_serial(ctx->phase, ctx->bitflags,
+                                            ctx->xsize, ctx->ysize);
+    }
+    double ws2 = omp_get_wtime();
+    printf("  [CUDA tiled] stage 1 residue wall time: %.4f ms\n", (ws2-ws1)*1000.0);
+
+    if (verify_effective && snap_after_res)
+        memcpy(snap_after_res, ctx->bitflags, (size_t)ctx->length);
+
+    /* Stage 2  */
+    double wb1 = omp_get_wtime();
+    GoldsteinBranchCuts_serial(ctx->bitflags, MaxCutLen,
+                               out->num_residues, ctx->xsize, ctx->ysize);
+    double wb2 = omp_get_wtime();
+    printf("  [CUDA tiled] stage 2 branch cuts wall time: %.4f ms\n", (wb2-wb1)*1000.0);
+
+    if (verify_effective && bf_preunwrap)
+        memcpy(bf_preunwrap, ctx->bitflags, (size_t)ctx->length);
+
+    /* Stage 3 */
+    double wu1 = omp_get_wtime();
+    unwrap_cuda_launch_unwrapping_tiled(
+        ctx->phase, ctx->bitflags, ctx->soln,
+        ctx->gradx, ctx->grady,
+        &ctx->cuda_dev,
+        ctx->xsize, ctx->ysize, ctx->length);
+    double wu2 = omp_get_wtime();
+    printf("  [CUDA tiled] stage 3 unwrap wall time: %.4f ms\n", (wu2-wu1)*1000.0);
+
+    out->num_pieces = 1;
+    out->elapsed_ms = (wu2 - ws1) * 1000.0;
 }
 
 static const unwrap_kernel_run_fn g_unwrap_kernel_runners[UNWRAP_BACKEND_COUNT] = {
     run_unwrap_kernel_parallel_cpu,
     run_unwrap_kernel_serial_cpu,
     run_unwrap_kernel_cuda,
+    run_unwrap_kernel_cuda_tiled,
 };
 
 static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
     "parallel_cpu",
     "serial_cpu",
     "cuda",
+    "cuda_tiled", 
 };
 
 /* -----------------------------------------------------------------------
@@ -1484,7 +1539,8 @@ double goldstein_phase_unwrapping(const char *input_path,
 
     verify_effective = verify_serial
     && (unwrap_backend == UNWRAP_BACKEND_PARALLEL_CPU
-        || unwrap_backend == UNWRAP_BACKEND_CUDA_STUB);
+        || unwrap_backend == UNWRAP_BACKEND_CUDA_STUB
+        || unwrap_backend == UNWRAP_BACKEND_CUDA_TILED);
     if (verify_serial && !verify_effective)
         fprintf(stderr,
                 "Note: --verify-serial applies only to the parallel_cpu "
@@ -1586,7 +1642,7 @@ double goldstein_phase_unwrapping(const char *input_path,
         kctx.gradx       = gradx;
         kctx.list        = list;
 
-        if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB) {
+        if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB || unwrap_backend == UNWRAP_BACKEND_CUDA_TILED) {
             int cuda_alloc_rc;
             if (unwrap_cuda_init() != 0)
                 fprintf(stderr,
@@ -1692,6 +1748,33 @@ double goldstein_phase_unwrapping(const char *input_path,
     snprintf(fname, sizeof(fname), "%s_unwrapped.tif", output_prefix);
     save_float_as_tiff(fname, soln, xsize, ysize);
 
+    /* ---- Tiled vs serial pixel diff (debug) ---- */
+    if (unwrap_backend == UNWRAP_BACKEND_CUDA_TILED) {
+        /* Load serial reference if it exists */
+        char ser_path[PATH_MAX];
+        snprintf(ser_path, sizeof(ser_path), "test_out_serial/size_%dx%d_wrapped_unwrapped.tif", xsize, ysize);
+        int sw, sh;
+        float *ser = tiff_io_load_float(ser_path, &sw, &sh);
+        if (ser && sw==xsize && sh==ysize) {
+            double sum=0, maxd=0, off;
+            int bad=0;
+            for(int k=0;k<length;k++) sum += soln[k]-ser[k];
+            off = sum/length;
+            for(int k=0;k<length;k++){
+                double d=fabs(soln[k]-ser[k]-off);
+                if(d>0.01){
+                    if(bad<10) printf("  BAD px %d (row=%d col=%d row%%32=%d col%%32=%d): serial=%.4f tiled=%.4f raw_diff=%.4f\n",
+                        k,k/xsize,k%xsize,(k/xsize)%32,(k%xsize)%32,ser[k],soln[k],(float)(soln[k]-ser[k]));
+                    bad++;
+                }
+            }
+                        printf("  [DIFF] offset=%.4f maxdiff=%.4f bad=%d/%d\n", off, maxd, bad, length);
+            free(ser);
+        } else {
+            printf("  [DIFF] serial reference not found at %s\n", ser_path);
+        }
+    }
+
     /* ---- RMS test against ground truth (float32 radians TIFF) ---- */
     if (gt_path) {
         float *truth = load_ground_truth_tiff(gt_path, xsize, ysize);
@@ -1743,6 +1826,9 @@ static int parse_unwrap_backend(const char *s)
         return UNWRAP_BACKEND_SERIAL_CPU;
     if (!strcasecmp(s, "cuda") || !strcasecmp(s, "cuda_stub"))
         return UNWRAP_BACKEND_CUDA_STUB;
+    if (!strcasecmp(s, "tiled") || !strcasecmp(s, "cuda_tiled"))
+        return UNWRAP_BACKEND_CUDA_TILED;
+    
     return -1;
 }
 
