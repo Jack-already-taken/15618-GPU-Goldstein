@@ -90,10 +90,10 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
  * and a 2D tile for the final AVOID-band fill pass.
  * ----------------------------------------------------------------------- */
 #ifndef STAGE1_RESIDUE_TILE_W
-#define STAGE1_RESIDUE_TILE_W 16
+#define STAGE1_RESIDUE_TILE_W 32
 #endif
 #ifndef STAGE1_RESIDUE_TILE_H
-#define STAGE1_RESIDUE_TILE_H 16
+#define STAGE1_RESIDUE_TILE_H 32
 #endif
 
 #ifndef STAGE2_PACK_THREADS
