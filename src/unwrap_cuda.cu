@@ -1146,7 +1146,7 @@ __global__ void k_apply_tile_offsets(float *soln,
     if (tile_known[tid]) soln[k] += tile_offsets[tid];
 }
 
-__global__ void k_bfs_expand(const float        *phase,
+// __global__ void k_bfs_expand(const float        *phase,
 //                               unsigned char      *bitflags,
 //                               float              *soln,
 //                               const float        *gradx,
