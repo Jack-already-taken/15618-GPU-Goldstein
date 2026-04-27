@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <vector>
+#include <algorithm>
+#include <numeric>
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
@@ -125,14 +128,13 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_USE_FIXED_BINS 1
 #endif
 #ifndef STAGE2_BIN_TILE_W
-/* Fixed spatial bin tile size in pixels. A 4096x4096 image uses 64x64 bins. */
 #define STAGE2_BIN_TILE_W 64
 #endif
 #ifndef STAGE2_BIN_TILE_H
 #define STAGE2_BIN_TILE_H 64
 #endif
 #ifndef STAGE2_BIN_CAP
-#define STAGE2_BIN_CAP 32
+#define STAGE2_BIN_CAP 128
 #endif
 #ifndef STAGE2_BIN_SEARCH_RADIUS
 #define STAGE2_BIN_SEARCH_RADIUS 2
@@ -176,6 +178,15 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #endif
 #ifndef STAGE3_TILE_RELAX_MAX_ITERS
 #define STAGE3_TILE_RELAX_MAX_ITERS 4096
+#endif
+
+#ifndef STAGE3_STITCH_MIN_SAMPLES
+/* Minimum agreeing boundary samples required to accept a tile-to-tile offset. */
+#define STAGE3_STITCH_MIN_SAMPLES 2
+#endif
+#ifndef STAGE3_STITCH_REQUIRE_MAJORITY
+/* Require chosen integer 2pi offset to be supported by at least half of valid boundary samples. */
+#define STAGE3_STITCH_REQUIRE_MAJORITY 1
 #endif
 
 
@@ -819,6 +830,165 @@ __global__ void k_tile_local_fourdir_floodfill(const float *phase,
         }
         ++restarts;
     }
+}
+
+
+/* -----------------------------------------------------------------------
+ * Robust tile height stitching.
+ *
+ * The old stitching path used the first valid pixel pair on a tile boundary.
+ * That is fragile: one bad pair near a branch cut can assign the wrong tile
+ * height. This path computes an integer 2*pi offset constraint from all valid
+ * samples on each right/down tile boundary and keeps only constraints with
+ * enough agreement.
+ * ----------------------------------------------------------------------- */
+
+__device__ __forceinline__ bool stitch_valid_pixel(const unsigned char *bitflags, int idx)
+{
+    return !(bitflags[idx] & kAvoid) && (bitflags[idx] & kUnwrapped);
+}
+
+__device__ __forceinline__ void add_k_vote(int k, int *vals, int *cnts, int &nvals)
+{
+    #pragma unroll 1
+    for (int i = 0; i < nvals; ++i) {
+        if (vals[i] == k) {
+            ++cnts[i];
+            return;
+        }
+    }
+    vals[nvals] = k;
+    cnts[nvals] = 1;
+    ++nvals;
+}
+
+__device__ __forceinline__ void select_k_vote(int total, int nvals,
+                                              const int *vals,
+                                              const int *cnts,
+                                              int *out_k,
+                                              int *out_conf)
+{
+    int best_k = 0;
+    int best_c = 0;
+    #pragma unroll 1
+    for (int i = 0; i < nvals; ++i) {
+        if (cnts[i] > best_c) {
+            best_c = cnts[i];
+            best_k = vals[i];
+        }
+    }
+
+    bool accept = (best_c >= STAGE3_STITCH_MIN_SAMPLES);
+#if STAGE3_STITCH_REQUIRE_MAJORITY
+    accept = accept && (best_c * 2 >= total);
+#endif
+
+    if (accept) {
+        *out_k = best_k;
+        *out_conf = best_c;
+    } else {
+        *out_k = 0;
+        *out_conf = 0;
+    }
+}
+
+__global__ void k_compute_tile_stitch_edges(const unsigned char *bitflags,
+                                            const float *soln,
+                                            const float *gradx,
+                                            const float *grady,
+                                            int *edge_right_k,
+                                            int *edge_right_conf,
+                                            int *edge_down_k,
+                                            int *edge_down_conf,
+                                            int tiles_x,
+                                            int tiles_y,
+                                            int xsize,
+                                            int ysize)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ntiles = tiles_x * tiles_y;
+    if (tid >= ntiles) return;
+
+    edge_right_k[tid] = 0;
+    edge_right_conf[tid] = 0;
+    edge_down_k[tid] = 0;
+    edge_down_conf[tid] = 0;
+
+    const int tx = tid % tiles_x;
+    const int ty = tid / tiles_x;
+    const float inv_twopi = 1.0f / (float)TWOPI;
+
+    if (tx + 1 < tiles_x) {
+        const int ax = min((tx + 1) * STAGE3_TILE_W, xsize) - 1;
+        const int bx = ax + 1;
+        const int y0 = ty * STAGE3_TILE_H;
+        const int y1 = min(y0 + STAGE3_TILE_H, ysize);
+
+        int vals[STAGE3_TILE_H];
+        int cnts[STAGE3_TILE_H];
+        int nvals = 0;
+        int total = 0;
+
+        #pragma unroll 1
+        for (int y = y0; y < y1; ++y) {
+            const int a = y * xsize + ax;
+            const int b = y * xsize + bx;
+            if (stitch_valid_pixel(bitflags, a) && stitch_valid_pixel(bitflags, b)) {
+                const float expected_b = soln[a] - gradx[a];
+                const int k = __float2int_rn((expected_b - soln[b]) * inv_twopi);
+                add_k_vote(k, vals, cnts, nvals);
+                ++total;
+            }
+        }
+        if (total > 0)
+            select_k_vote(total, nvals, vals, cnts, &edge_right_k[tid], &edge_right_conf[tid]);
+    }
+
+    if (ty + 1 < tiles_y) {
+        const int ay = min((ty + 1) * STAGE3_TILE_H, ysize) - 1;
+        const int by = ay + 1;
+        const int x0 = tx * STAGE3_TILE_W;
+        const int x1 = min(x0 + STAGE3_TILE_W, xsize);
+
+        int vals[STAGE3_TILE_W];
+        int cnts[STAGE3_TILE_W];
+        int nvals = 0;
+        int total = 0;
+
+        #pragma unroll 1
+        for (int x = x0; x < x1; ++x) {
+            const int a = ay * xsize + x;
+            const int b = by * xsize + x;
+            if (stitch_valid_pixel(bitflags, a) && stitch_valid_pixel(bitflags, b)) {
+                const float expected_b = soln[a] - grady[a];
+                const int k = __float2int_rn((expected_b - soln[b]) * inv_twopi);
+                add_k_vote(k, vals, cnts, nvals);
+                ++total;
+            }
+        }
+        if (total > 0)
+            select_k_vote(total, nvals, vals, cnts, &edge_down_k[tid], &edge_down_conf[tid]);
+    }
+}
+
+__global__ void k_apply_tile_offsets_all(float *soln,
+                                         const unsigned char *bitflags,
+                                         const float *tile_offsets,
+                                         int tiles_x,
+                                         int xsize,
+                                         int ysize)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= xsize || y >= ysize) return;
+
+    const int k = y * xsize + x;
+    if (bitflags[k] & kAvoid) return;
+
+    const int tx = x / STAGE3_TILE_W;
+    const int ty = y / STAGE3_TILE_H;
+    const int tid = ty * tiles_x + tx;
+    soln[k] += tile_offsets[tid];
 }
 
 __device__ __forceinline__ bool first_valid_boundary_pair_right(const unsigned char *bitflags,
@@ -1615,20 +1785,23 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     const int ntiles = tiles_x * tiles_y;
     const int tile_threads = 256;
     const int tile_blocks = div_up_int(ntiles, tile_threads);
-    const int max_relax = min(STAGE3_TILE_RELAX_MAX_ITERS, tiles_x + tiles_y + 8);
-    int h_changed = 1;
-    int relax_iter = 0;
 
-    int *d_tile_known = nullptr;
-    int *d_changed = nullptr;
+    int *d_edge_right_k = nullptr;
+    int *d_edge_right_conf = nullptr;
+    int *d_edge_down_k = nullptr;
+    int *d_edge_down_conf = nullptr;
     float *d_tile_offsets = nullptr;
 
-    e = cudaMalloc((void **)&d_tile_known, (size_t)ntiles * sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc tile_known")) goto cleanup;
+    e = cudaMalloc((void **)&d_edge_right_k, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc edge_right_k")) goto cleanup;
+    e = cudaMalloc((void **)&d_edge_right_conf, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc edge_right_conf")) goto cleanup;
+    e = cudaMalloc((void **)&d_edge_down_k, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc edge_down_k")) goto cleanup;
+    e = cudaMalloc((void **)&d_edge_down_conf, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc edge_down_conf")) goto cleanup;
     e = cudaMalloc((void **)&d_tile_offsets, (size_t)ntiles * sizeof(float));
     if (cuda_fail(e, "Stage3 malloc tile_offsets")) goto cleanup;
-    e = cudaMalloc((void **)&d_changed, sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc changed")) goto cleanup;
 
     cudaEventRecord(t0, 0);
     e = cudaMemcpy(dev->d_phase, h_phase, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
@@ -1661,44 +1834,139 @@ extern "C" void unwrap_cuda_launch_unwrapping(
 
     cudaEventRecord(t0, 0);
     {
-        k_init_tile_offsets<<<tile_blocks, tile_threads>>>(dev->d_bitflags, d_tile_known, d_tile_offsets,
-                                                 tiles_x, tiles_y, xsize, ysize);
+        k_compute_tile_stitch_edges<<<tile_blocks, tile_threads>>>(dev->d_bitflags, dev->d_soln,
+                                                                  dev->d_gradx, dev->d_grady,
+                                                                  d_edge_right_k, d_edge_right_conf,
+                                                                  d_edge_down_k, d_edge_down_conf,
+                                                                  tiles_x, tiles_y, xsize, ysize);
         e = cudaGetLastError();
-        if (cuda_fail(e, "k_init_tile_offsets")) goto cleanup;
+        if (cuda_fail(e, "k_compute_tile_stitch_edges")) goto cleanup;
         e = cudaDeviceSynchronize();
-        if (cuda_fail(e, "sync k_init_tile_offsets")) goto cleanup;
+        if (cuda_fail(e, "sync k_compute_tile_stitch_edges")) goto cleanup;
     }
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 init tile offsets", t0, t1);
+    print_cuda_interval("Stage3 compute stitch edges", t0, t1);
 
     cudaEventRecord(t0, 0);
-    while (h_changed && relax_iter < max_relax) {
-        h_changed = 0;
-        cudaMemset(d_changed, 0, sizeof(int));
-        k_tile_offset_relax<<<tile_blocks, tile_threads>>>(dev->d_bitflags, dev->d_soln,
-                                                 dev->d_gradx, dev->d_grady,
-                                                 d_tile_known, d_tile_offsets, d_changed,
-                                                 tiles_x, tiles_y, xsize, ysize);
-        e = cudaGetLastError();
-        if (cuda_fail(e, "k_tile_offset_relax")) goto cleanup;
-        e = cudaDeviceSynchronize();
-        if (cuda_fail(e, "sync k_tile_offset_relax")) goto cleanup;
-        cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
-        ++relax_iter;
+    {
+        std::vector<int> h_right_k(ntiles), h_right_conf(ntiles), h_down_k(ntiles), h_down_conf(ntiles);
+        e = cudaMemcpy(h_right_k.data(), d_edge_right_k, (size_t)ntiles * sizeof(int), cudaMemcpyDeviceToHost);
+        if (cuda_fail(e, "Stage3 D2H edge_right_k")) goto cleanup;
+        e = cudaMemcpy(h_right_conf.data(), d_edge_right_conf, (size_t)ntiles * sizeof(int), cudaMemcpyDeviceToHost);
+        if (cuda_fail(e, "Stage3 D2H edge_right_conf")) goto cleanup;
+        e = cudaMemcpy(h_down_k.data(), d_edge_down_k, (size_t)ntiles * sizeof(int), cudaMemcpyDeviceToHost);
+        if (cuda_fail(e, "Stage3 D2H edge_down_k")) goto cleanup;
+        e = cudaMemcpy(h_down_conf.data(), d_edge_down_conf, (size_t)ntiles * sizeof(int), cudaMemcpyDeviceToHost);
+        if (cuda_fail(e, "Stage3 D2H edge_down_conf")) goto cleanup;
+
+        struct Edge {
+            int a;
+            int b;
+            int k;      /* offset[b] - offset[a], in units of 2*pi */
+            int conf;   /* number of agreeing boundary samples */
+        };
+
+        std::vector<Edge> edges;
+        edges.reserve((size_t)2 * ntiles);
+        for (int ty = 0; ty < tiles_y; ++ty) {
+            for (int tx = 0; tx < tiles_x; ++tx) {
+                const int tid = ty * tiles_x + tx;
+                if (tx + 1 < tiles_x && h_right_conf[tid] > 0) {
+                    edges.push_back({tid, tid + 1, h_right_k[tid], h_right_conf[tid]});
+                }
+                if (ty + 1 < tiles_y && h_down_conf[tid] > 0) {
+                    edges.push_back({tid, tid + tiles_x, h_down_k[tid], h_down_conf[tid]});
+                }
+            }
+        }
+
+        std::sort(edges.begin(), edges.end(), [](const Edge &x, const Edge &y) {
+            return x.conf > y.conf;
+        });
+
+        struct WeightedDSU {
+            std::vector<int> parent;
+            std::vector<int> rank;
+            std::vector<int> diff; /* offset[x] - offset[parent[x]], in 2*pi units */
+
+            explicit WeightedDSU(int n) : parent(n), rank(n, 0), diff(n, 0) {
+                std::iota(parent.begin(), parent.end(), 0);
+            }
+
+            int find(int x) {
+                if (parent[x] == x) return x;
+                const int p = parent[x];
+                const int r = find(p);
+                diff[x] += diff[p];
+                parent[x] = r;
+                return r;
+            }
+
+            int potential(int x) {
+                find(x);
+                return diff[x];
+            }
+
+            bool unite(int a, int b, int w) {
+                /* Enforce offset[b] - offset[a] = w. */
+                int ra = find(a);
+                int rb = find(b);
+                int da = diff[a];
+                int db = diff[b];
+                if (ra == rb) return false;
+
+                if (rank[ra] < rank[rb]) {
+                    /* parent[ra] = rb; diff[ra] = offset[ra] - offset[rb]. */
+                    parent[ra] = rb;
+                    diff[ra] = db - da - w;
+                } else {
+                    /* parent[rb] = ra; diff[rb] = offset[rb] - offset[ra]. */
+                    parent[rb] = ra;
+                    diff[rb] = w + da - db;
+                    if (rank[ra] == rank[rb]) ++rank[ra];
+                }
+                return true;
+            }
+        };
+
+        WeightedDSU dsu(ntiles);
+        int accepted_edges = 0;
+        for (const Edge &ed : edges) {
+            if (dsu.unite(ed.a, ed.b, ed.k)) ++accepted_edges;
+        }
+
+        std::vector<float> h_tile_offsets(ntiles, 0.0f);
+        std::vector<int> root_seen(ntiles, 0);
+        int components = 0;
+        for (int t = 0; t < ntiles; ++t) {
+            const int root = dsu.find(t);
+            if (!root_seen[root]) {
+                root_seen[root] = 1;
+                ++components;
+            }
+            h_tile_offsets[t] = (float)dsu.potential(t) * (float)TWOPI;
+        }
+
+        e = cudaMemcpy(d_tile_offsets, h_tile_offsets.data(), (size_t)ntiles * sizeof(float), cudaMemcpyHostToDevice);
+        if (cuda_fail(e, "Stage3 H2D tile_offsets")) goto cleanup;
+
+        printf("  [GPU] Stage3 stitch: candidate_edges=%zu accepted_edges=%d components=%d min_agree=%d majority=%d\n",
+               edges.size(), accepted_edges, components,
+               STAGE3_STITCH_MIN_SAMPLES, STAGE3_STITCH_REQUIRE_MAJORITY);
     }
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 tile offset relax", t0, t1);
+    print_cuda_interval("Stage3 CPU solve tile heights", t0, t1);
 
     cudaEventRecord(t0, 0);
     {
         dim3 block(STAGE3_AVOID_TILE_W, STAGE3_AVOID_TILE_H);
         dim3 grid(div_up_int(xsize, STAGE3_AVOID_TILE_W), div_up_int(ysize, STAGE3_AVOID_TILE_H));
-        k_apply_tile_offsets<<<grid, block>>>(dev->d_soln, dev->d_bitflags, d_tile_known,
-                                              d_tile_offsets, tiles_x, xsize, ysize);
+        k_apply_tile_offsets_all<<<grid, block>>>(dev->d_soln, dev->d_bitflags,
+                                                  d_tile_offsets, tiles_x, xsize, ysize);
         e = cudaGetLastError();
-        if (cuda_fail(e, "k_apply_tile_offsets")) goto cleanup;
+        if (cuda_fail(e, "k_apply_tile_offsets_all")) goto cleanup;
         k_avoid_fill<<<grid, block>>>(dev->d_phase, dev->d_bitflags, dev->d_soln, xsize, ysize);
         e = cudaGetLastError();
         if (cuda_fail(e, "k_avoid_fill")) goto cleanup;
@@ -1721,13 +1989,15 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     cudaEventRecord(total1, 0);
     cudaEventSynchronize(total1);
     print_cuda_interval("Stage3 tile total", total0, total1);
-    printf("  [GPU] Stage3 tile fourdir: tile=%dx%d tiles=%dx%d relax_iters=%d/%d\n",
-           STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y, relax_iter, max_relax);
+    printf("  [GPU] Stage3 tile fourdir+robust-stitch: tile=%dx%d tiles=%dx%d\n",
+           STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y);
 
 cleanup:
-    cudaFree(d_tile_known);
+    cudaFree(d_edge_right_k);
+    cudaFree(d_edge_right_conf);
+    cudaFree(d_edge_down_k);
+    cudaFree(d_edge_down_conf);
     cudaFree(d_tile_offsets);
-    cudaFree(d_changed);
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
     cudaEventDestroy(total0);
