@@ -1518,8 +1518,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int length)
 {
     printf("  [GPU][Stage3 timing] begin (tile-independent unwrap + tile-graph height stitching111)\n");
-    (void)h_gradx;
-    (void)h_grady;
+    // (void)h_gradx;
+    // (void)h_grady;
 
     if (!h_phase || !h_bitflags || !h_soln
         || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
