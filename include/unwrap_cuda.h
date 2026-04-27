@@ -10,20 +10,41 @@ typedef struct UnwrapCudaDeviceBufs {
     // Stage 1: Residue Identification
     float          *d_phase;
     unsigned char  *d_bitflags;
+
     // Stage 2: Residue Matching
     int            *d_pos_residues;
     int            *d_neg_residues;
     int            *d_pairs;
-    
-    float          *d_soln;
     int            *d_residue_count;
-    // Stage 3: Unwrapping
+
+    // Stage 2 fixed-bin scratch, allocated once in unwrap_cuda_device_bufs_alloc.
+    int            *d_bin_counts;
+    int            *d_bin_items;
+    int            *d_bin_overflow;
+    int            *d_stage2_verify_stats;
+    int             stage2_nbins;
+    int             stage2_bin_items;
+
+    // Stage 3: tile-local unwrap and tile-graph stitching.
+    float          *d_soln;
     float          *d_gradx;
     float          *d_grady;
-    int            *d_frontier_a;
-    int            *d_frontier_b;
-    int            *d_frontier_count_a;
-    int            *d_frontier_count_b;
+    int            *d_tile_has_valid;
+    int            *d_edge_valid;
+    int            *d_edge_delta_k;
+    int            *d_tile_known;
+    int            *d_tile_offset_k;
+
+    // Stage 3 host/CPU scratch for the tile-graph solve, allocated once.
+    int            *h_tile_has_valid;
+    int            *h_edge_valid;
+    int            *h_edge_delta_k;
+    int            *h_tile_known;
+    int            *h_tile_offset_k;
+    int            *h_queue;
+
+    int             stage3_tile_capacity;
+    int             stage3_edge_capacity;
 } UnwrapCudaDeviceBufs;
 
 /**

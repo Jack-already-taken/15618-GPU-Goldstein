@@ -158,7 +158,7 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #define STAGE3_TILE_H 32
 #endif
 #ifndef STAGE3_TILE_LOCAL_MAX_RESTARTS
-#define STAGE3_TILE_LOCAL_MAX_RESTARTS 64
+#define STAGE3_TILE_LOCAL_MAX_RESTARTS 1
 #endif
 #ifndef STAGE3_TILE_RELAX_MAX_ITERS
 #define STAGE3_TILE_RELAX_MAX_ITERS 4096
@@ -313,6 +313,27 @@ static inline float host_gradient(float p1, float p2)
 static inline int div_up_int(int a, int b)
 {
     return (a + b - 1) / b;
+}
+
+static inline int stage2_nbins_value(void)
+{
+    return STAGE2_BIN_GRID_X * STAGE2_BIN_GRID_Y;
+}
+
+static inline int stage2_bin_items_value(void)
+{
+    return STAGE2_BIN_GRID_X * STAGE2_BIN_GRID_Y * STAGE2_BIN_CAP;
+}
+
+static inline int stage3_max_tiles_from_length(int length)
+{
+    const int min_tile = (STAGE3_TILE_W < STAGE3_TILE_H) ? STAGE3_TILE_W : STAGE3_TILE_H;
+    return div_up_int(length, min_tile);
+}
+
+static inline int stage3_max_edges_from_length(int length)
+{
+    return 2 * stage3_max_tiles_from_length(length);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -647,18 +668,19 @@ __global__ void k_verify_stage2_branchcuts(const unsigned char *__restrict__ bit
 static void verify_stage2_branchcuts_device(const UnwrapCudaDeviceBufs *dev,
                                             int length, int xsize, int ysize)
 {
-    if (!dev || !dev->d_bitflags || length <= 0 || xsize <= 0 || ysize <= 0)
+    if (!dev || !dev->d_bitflags || !dev->d_stage2_verify_stats ||
+        length <= 0 || xsize <= 0 || ysize <= 0)
         return;
 
-    int *d_stats = nullptr;
+    int *const d_stats = dev->d_stage2_verify_stats;
     int h_stats[6] = {0, 0, 0, 0, 0, 0};
-    cudaError_t e = cudaMalloc((void **)&d_stats, sizeof(h_stats));
+
+    cudaError_t e = cudaMemset(d_stats, 0, sizeof(h_stats));
     if (e != cudaSuccess) {
-        cuda_fail(e, "cudaMalloc stage2 verify stats");
+        cuda_fail(e, "memset stage2 verify stats");
         return;
     }
 
-    cudaMemset(d_stats, 0, sizeof(h_stats));
     const int threads = STAGE2_GROW_THREADS;
     const int blocks = (length + threads - 1) / threads;
     k_verify_stage2_branchcuts<<<blocks, threads>>>(dev->d_bitflags, length,
@@ -666,22 +688,18 @@ static void verify_stage2_branchcuts_device(const UnwrapCudaDeviceBufs *dev,
     e = cudaGetLastError();
     if (e != cudaSuccess) {
         cuda_fail(e, "k_verify_stage2_branchcuts");
-        cudaFree(d_stats);
         return;
     }
     e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         cuda_fail(e, "sync stage2 verify");
-        cudaFree(d_stats);
         return;
     }
     e = cudaMemcpy(h_stats, d_stats, sizeof(h_stats), cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
         cuda_fail(e, "D2H stage2 verify stats");
-        cudaFree(d_stats);
         return;
     }
-    cudaFree(d_stats);
 
     const double miss_pct = h_stats[0] ? 100.0 * (double)h_stats[1] / (double)h_stats[0] : 0.0;
     const double border_pct = h_stats[4] ? 100.0 * (double)h_stats[5] / (double)h_stats[4] : 0.0;
@@ -1175,26 +1193,22 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
         return -1;
     memset(out, 0, sizeof(*out));
 
+    out->stage2_nbins = stage2_nbins_value();
+    out->stage2_bin_items = stage2_bin_items_value();
+    out->stage3_tile_capacity = stage3_max_tiles_from_length(length);
+    out->stage3_edge_capacity = stage3_max_edges_from_length(length);
+
     e = cudaMalloc((void **)&out->d_phase, (size_t)length * sizeof(float));
     if (e != cudaSuccess)
         return (int)e;
     e = cudaMalloc((void **)&out->d_bitflags, (((size_t)length + 3u) & ~((size_t)3u)) * sizeof(unsigned char));
-    if (e != cudaSuccess) {
-        unwrap_cuda_device_bufs_free(out);
-        return (int)e;
-    }
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
     e = cudaMalloc((void **)&out->d_soln, (size_t)length * sizeof(float));
-    if (e != cudaSuccess) {
-        unwrap_cuda_device_bufs_free(out);
-        return (int)e;
-    }
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
     e = cudaMalloc((void **)&out->d_residue_count, sizeof(int));
-    if (e != cudaSuccess) {
-        unwrap_cuda_device_bufs_free(out);
-        return (int)e;
-    }
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
-    /* Stage 2 original scratch buffers. Counters live at [0], residue data starts at [1]. */
+    /* Stage 2 residue lists and pair buffer. Counters live at [0], residue data starts at [1]. */
     e = cudaMalloc((void **)&out->d_pos_residues, (size_t)length * sizeof(int));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
     e = cudaMalloc((void **)&out->d_neg_residues, (size_t)length * sizeof(int));
@@ -1202,12 +1216,46 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
     e = cudaMalloc((void **)&out->d_pairs, (size_t)length * sizeof(int));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
-    e = cudaMalloc((void **)&out->d_gradx, (size_t)length * sizeof(float));
+    /* Stage 2 fixed-bin scratch. These are reset, not reallocated, per launch. */
+    e = cudaMalloc((void **)&out->d_bin_counts, (size_t)out->stage2_nbins * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_bin_items, (size_t)out->stage2_bin_items * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_bin_overflow, sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_stage2_verify_stats, 6 * sizeof(int));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
+    /* Stage 3 image buffers. */
+    e = cudaMalloc((void **)&out->d_gradx, (size_t)length * sizeof(float));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
     e = cudaMalloc((void **)&out->d_grady, (size_t)length * sizeof(float));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-    /* Stage 3 tile-independent path does not allocate old pixel-propagation buffers. */
+
+    /* Stage 3 tile-graph device scratch. Capacity is a safe upper bound derived from length only. */
+    e = cudaMalloc((void **)&out->d_tile_has_valid, (size_t)out->stage3_tile_capacity * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_edge_valid, (size_t)out->stage3_edge_capacity * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_edge_delta_k, (size_t)out->stage3_edge_capacity * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_tile_known, (size_t)out->stage3_tile_capacity * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    e = cudaMalloc((void **)&out->d_tile_offset_k, (size_t)out->stage3_tile_capacity * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+
+    /* Stage 3 tile-graph host scratch. These replace per-launch malloc/calloc. */
+    out->h_tile_has_valid = (int*)calloc((size_t)out->stage3_tile_capacity, sizeof(int));
+    out->h_edge_valid     = (int*)calloc((size_t)out->stage3_edge_capacity, sizeof(int));
+    out->h_edge_delta_k   = (int*)calloc((size_t)out->stage3_edge_capacity, sizeof(int));
+    out->h_tile_known     = (int*)calloc((size_t)out->stage3_tile_capacity, sizeof(int));
+    out->h_tile_offset_k  = (int*)calloc((size_t)out->stage3_tile_capacity, sizeof(int));
+    out->h_queue          = (int*)malloc((size_t)out->stage3_tile_capacity * sizeof(int));
+    if (!out->h_tile_has_valid || !out->h_edge_valid || !out->h_edge_delta_k ||
+        !out->h_tile_known || !out->h_tile_offset_k || !out->h_queue) {
+        unwrap_cuda_device_bufs_free(out);
+        return -2;
+    }
 
     return 0;
 }
@@ -1223,12 +1271,27 @@ extern "C" void unwrap_cuda_device_bufs_free(UnwrapCudaDeviceBufs *buf)
     cudaFree(buf->d_pos_residues);
     cudaFree(buf->d_neg_residues);
     cudaFree(buf->d_pairs);
+    cudaFree(buf->d_bin_counts);
+    cudaFree(buf->d_bin_items);
+    cudaFree(buf->d_bin_overflow);
+    cudaFree(buf->d_stage2_verify_stats);
     cudaFree(buf->d_gradx);
     cudaFree(buf->d_grady);
+    cudaFree(buf->d_tile_has_valid);
+    cudaFree(buf->d_edge_valid);
+    cudaFree(buf->d_edge_delta_k);
+    cudaFree(buf->d_tile_known);
+    cudaFree(buf->d_tile_offset_k);
+
+    free(buf->h_tile_has_valid);
+    free(buf->h_edge_valid);
+    free(buf->h_edge_delta_k);
+    free(buf->h_tile_known);
+    free(buf->h_tile_offset_k);
+    free(buf->h_queue);
+
     memset(buf, 0, sizeof(*buf));
 }
-
-
 
 extern "C" int unwrap_cuda_launch_residue_identification(
     float *h_phase, unsigned char *h_bitflags, const UnwrapCudaDeviceBufs *dev, int xsize, int ysize,
@@ -1411,23 +1474,27 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
 
 #if STAGE2_USE_FIXED_BINS
     const int n_bins = STAGE2_BIN_GRID_X * STAGE2_BIN_GRID_Y;
+    if (!dev->d_bin_counts || !dev->d_bin_items || !dev->d_bin_overflow ||
+        dev->stage2_nbins < n_bins ||
+        dev->stage2_bin_items < n_bins * STAGE2_BIN_CAP) {
+        fprintf(stderr, "residue_matching: fixed-bin scratch buffers were not allocated correctly\n");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
+    d_bin_counts = dev->d_bin_counts;
+    d_bin_items = dev->d_bin_items;
+    d_bin_overflow = dev->d_bin_overflow;
+
     cudaEventRecord(t0, 0);
-    e = cudaMalloc((void **)&d_bin_counts, (size_t)n_bins * sizeof(int));
-    if (e == cudaSuccess)
-        e = cudaMalloc((void **)&d_bin_items,
-                       (size_t)n_bins * (size_t)STAGE2_BIN_CAP * sizeof(int));
-    if (e == cudaSuccess)
-        e = cudaMalloc((void **)&d_bin_overflow, sizeof(int));
-    if (e == cudaSuccess)
-        e = cudaMemsetAsync(d_bin_counts, 0, (size_t)n_bins * sizeof(int));
+    e = cudaMemsetAsync(d_bin_counts, 0, (size_t)n_bins * sizeof(int));
     if (e == cudaSuccess)
         e = cudaMemsetAsync(d_bin_overflow, 0, sizeof(int));
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage2 fixed-bin alloc/reset", t0, t1);
+    print_cuda_interval("Stage2 fixed-bin reset", t0, t1);
     if (e != cudaSuccess) {
-        cuda_fail(e, "Stage2 fixed-bin alloc/reset");
-        cudaFree(d_bin_counts); cudaFree(d_bin_items); cudaFree(d_bin_overflow);
+        cuda_fail(e, "Stage2 fixed-bin reset");
         cudaEventDestroy(t0); cudaEventDestroy(t1);
         return;
     }
@@ -1445,7 +1512,6 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
         print_cuda_interval("Stage2 k_bin_majority", t0, t1);
         if ((e = cudaGetLastError()) != cudaSuccess) {
             cuda_fail(e, "k_bin_majority_residues");
-            cudaFree(d_bin_counts); cudaFree(d_bin_items); cudaFree(d_bin_overflow);
             cudaEventDestroy(t0); cudaEventDestroy(t1);
             return;
         }
@@ -1489,17 +1555,10 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
 
         if ((e = cudaGetLastError()) != cudaSuccess) {
             cuda_fail(e, "Stage2 matching");
-            cudaFree(d_bin_counts); cudaFree(d_bin_items); cudaFree(d_bin_overflow);
             cudaEventDestroy(t0); cudaEventDestroy(t1);
             return;
         }
     }
-
-#if STAGE2_USE_FIXED_BINS
-    cudaFree(d_bin_counts);
-    cudaFree(d_bin_items);
-    cudaFree(d_bin_overflow);
-#endif
 
     /* ---- Kernel 3: leftover majority -> edge ----------------------------- */
     const int n_leftover = n_maj - n_min;
@@ -1581,9 +1640,13 @@ extern "C" void unwrap_cuda_launch_unwrapping(
 
     if (!h_phase || !h_bitflags || !h_soln
         || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
-        || !dev->d_gradx || !dev->d_grady || xsize <= 0 || ysize <= 0
-        || length != xsize * ysize) {
-        fprintf(stderr, "unwrap_cuda: invalid Stage3 arguments\n");
+        || !dev->d_gradx || !dev->d_grady
+        || !dev->d_tile_has_valid || !dev->d_edge_valid || !dev->d_edge_delta_k
+        || !dev->d_tile_known || !dev->d_tile_offset_k
+        || !dev->h_tile_has_valid || !dev->h_edge_valid || !dev->h_edge_delta_k
+        || !dev->h_tile_known || !dev->h_tile_offset_k || !dev->h_queue
+        || xsize <= 0 || ysize <= 0 || length != xsize * ysize) {
+        fprintf(stderr, "unwrap_cuda: invalid Stage3 arguments or missing preallocated scratch buffers\n");
         return;
     }
 
@@ -1600,24 +1663,32 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     const int tile_threads = 256;
     const int tile_blocks = div_up_int(ntiles, tile_threads);
 
-    int *d_tile_has_valid = nullptr;
-    int *d_edge_valid = nullptr;
-    int *d_edge_delta_k = nullptr;
-    int *d_tile_known = nullptr;
-    int *d_tile_offset_k = nullptr;
+    int *const d_tile_has_valid = dev->d_tile_has_valid;
+    int *const d_edge_valid = dev->d_edge_valid;
+    int *const d_edge_delta_k = dev->d_edge_delta_k;
+    int *const d_tile_known = dev->d_tile_known;
+    int *const d_tile_offset_k = dev->d_tile_offset_k;
 
-    int *h_tile_has_valid = nullptr;
-    int *h_edge_valid = nullptr;
-    int *h_edge_delta_k = nullptr;
-    int *h_tile_known = nullptr;
-    int *h_tile_offset_k = nullptr;
-    int *h_queue = nullptr;
+    int *const h_tile_has_valid = dev->h_tile_has_valid;
+    int *const h_edge_valid = dev->h_edge_valid;
+    int *const h_edge_delta_k = dev->h_edge_delta_k;
+    int *const h_tile_known = dev->h_tile_known;
+    int *const h_tile_offset_k = dev->h_tile_offset_k;
+    int *const h_queue = dev->h_queue;
 
     int valid_edges = 0;
     int visited_tiles = 0;
     int components = 0;
     int conflicts = 0;
     int max_abs_offset_k = 0;
+
+    if (ntiles > dev->stage3_tile_capacity || edge_count > dev->stage3_edge_capacity) {
+        fprintf(stderr,
+                "unwrap_cuda: Stage3 tile scratch capacity too small "
+                "(need tiles=%d edges=%d, have tiles=%d edges=%d)\n",
+                ntiles, edge_count, dev->stage3_tile_capacity, dev->stage3_edge_capacity);
+        return;
+    }
 
     e = cudaEventCreate(&t0);
     if (cuda_fail(e, "Stage3 create event t0")) goto cleanup;
@@ -1630,28 +1701,10 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     e = cudaEventRecord(total0, 0);
     if (cuda_fail(e, "Stage3 record total0")) goto cleanup;
 
-    h_tile_has_valid = (int*)calloc((size_t)ntiles, sizeof(int));
-    h_edge_valid     = (int*)calloc((size_t)edge_count, sizeof(int));
-    h_edge_delta_k   = (int*)calloc((size_t)edge_count, sizeof(int));
-    h_tile_known     = (int*)calloc((size_t)ntiles, sizeof(int));
-    h_tile_offset_k  = (int*)calloc((size_t)ntiles, sizeof(int));
-    h_queue          = (int*)malloc((size_t)ntiles * sizeof(int));
-    if (!h_tile_has_valid || !h_edge_valid || !h_edge_delta_k ||
-        !h_tile_known || !h_tile_offset_k || !h_queue) {
-        fprintf(stderr, "unwrap_cuda: Stage3 host allocation failed\n");
-        goto cleanup;
-    }
-
-    e = cudaMalloc((void **)&d_tile_has_valid, (size_t)ntiles * sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc tile_has_valid")) goto cleanup;
-    e = cudaMalloc((void **)&d_edge_valid, (size_t)edge_count * sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc edge_valid")) goto cleanup;
-    e = cudaMalloc((void **)&d_edge_delta_k, (size_t)edge_count * sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc edge_delta_k")) goto cleanup;
-    e = cudaMalloc((void **)&d_tile_known, (size_t)ntiles * sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc tile_known")) goto cleanup;
-    e = cudaMalloc((void **)&d_tile_offset_k, (size_t)ntiles * sizeof(int));
-    if (cuda_fail(e, "Stage3 malloc tile_offset_k")) goto cleanup;
+    /* Per-launch host scratch reset.  The arrays themselves are allocated once
+       by unwrap_cuda_device_bufs_alloc and freed by unwrap_cuda_device_bufs_free. */
+    memset(h_tile_known, 0, (size_t)ntiles * sizeof(int));
+    memset(h_tile_offset_k, 0, (size_t)ntiles * sizeof(int));
 
     cudaEventRecord(t0, 0);
     e = cudaMemcpy(dev->d_phase, h_phase, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
@@ -1869,19 +1922,6 @@ extern "C" void unwrap_cuda_launch_unwrapping(
            STAGE3_STITCH_MIN_SUPPORT, STAGE3_STITCH_REQUIRE_MAJORITY);
 
 cleanup:
-    cudaFree(d_tile_has_valid);
-    cudaFree(d_edge_valid);
-    cudaFree(d_edge_delta_k);
-    cudaFree(d_tile_known);
-    cudaFree(d_tile_offset_k);
-
-    free(h_tile_has_valid);
-    free(h_edge_valid);
-    free(h_edge_delta_k);
-    free(h_tile_known);
-    free(h_tile_offset_k);
-    free(h_queue);
-
     if (t0) cudaEventDestroy(t0);
     if (t1) cudaEventDestroy(t1);
     if (total0) cudaEventDestroy(total0);
