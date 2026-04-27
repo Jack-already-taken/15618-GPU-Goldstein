@@ -125,13 +125,13 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_USE_FIXED_BINS 1
 #endif
 #ifndef STAGE2_BIN_GRID_X
-#define STAGE2_BIN_GRID_X 128
+#define STAGE2_BIN_GRID_X 64
 #endif
 #ifndef STAGE2_BIN_GRID_Y
-#define STAGE2_BIN_GRID_Y 128
+#define STAGE2_BIN_GRID_Y 64
 #endif
 #ifndef STAGE2_BIN_CAP
-#define STAGE2_BIN_CAP 32
+#define STAGE2_BIN_CAP 128
 #endif
 #ifndef STAGE2_BIN_SEARCH_RADIUS
 #define STAGE2_BIN_SEARCH_RADIUS 2
