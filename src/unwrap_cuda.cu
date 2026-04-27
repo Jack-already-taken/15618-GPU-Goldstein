@@ -1517,6 +1517,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int ysize,
     int length)
 {
+    printf("  [GPU][Stage3 timing] begin (tile-independent unwrap + tile-graph height stitching111)\n");
     (void)h_gradx;
     (void)h_grady;
 
