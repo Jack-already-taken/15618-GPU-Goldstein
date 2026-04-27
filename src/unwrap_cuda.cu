@@ -124,11 +124,12 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
    so overflowed residues are dropped from the bin lookup and counted. */
 #define STAGE2_USE_FIXED_BINS 1
 #endif
-#ifndef STAGE2_BIN_GRID_X
-#define STAGE2_BIN_GRID_X 128
+#ifndef STAGE2_BIN_TILE_W
+/* Fixed spatial bin tile size in pixels. A 4096x4096 image uses 64x64 bins. */
+#define STAGE2_BIN_TILE_W 64
 #endif
-#ifndef STAGE2_BIN_GRID_Y
-#define STAGE2_BIN_GRID_Y 128
+#ifndef STAGE2_BIN_TILE_H
+#define STAGE2_BIN_TILE_H 64
 #endif
 #ifndef STAGE2_BIN_CAP
 #define STAGE2_BIN_CAP 32
@@ -301,22 +302,25 @@ static inline int div_up_int(int a, int b)
 /*  whole image and nothing bad would happen, but the early return matches   */
 /*  the residue-valid region exactly and skips a pointless bitflags read.    */
 
-__global__ void k_pack_residues(const unsigned char *bitflags,
-                                int *pos_residues, int *neg_residues,
-                                int xsize, int ysize)
+__global__ void k_pack_residues_and_mark_cuts(unsigned char *bitflags,
+                                             int *pos_residues, int *neg_residues,
+                                             int xsize, int ysize)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= xsize - 1 || j >= ysize - 1)
         return;
 
-    const unsigned char b = bitflags[j * xsize + i];
+    const int idx_img = j * xsize + i;
+    const unsigned char b = bitflags[idx_img];
     const int enc = encode_ij(i, j);
 
     if (b & kPosRes) {
+        bitflags[idx_img] = (unsigned char)(b | kBranchCut);
         const int idx = atomicAdd(&pos_residues[0], 1);
         pos_residues[1 + idx] = enc;
     } else if (b & kNegRes) {
+        bitflags[idx_img] = (unsigned char)(b | kBranchCut);
         const int idx = atomicAdd(&neg_residues[0], 1);
         neg_residues[1 + idx] = enc;
     }
@@ -410,15 +414,15 @@ __global__ void k_match_residues(const int *__restrict__ d_minority,
 /* ------------------------------------------------------------------------- */
 /*  Stage 2 fixed-bin spatial lookup                                         */
 /* ------------------------------------------------------------------------- */
-__device__ __forceinline__ int stage2_bin_id_from_xy(int i, int j, int xsize, int ysize)
+__device__ __forceinline__ int stage2_bin_id_from_xy(int i, int j, int bin_grid_x, int bin_grid_y)
 {
-    int bx = (int)(((long long)i * STAGE2_BIN_GRID_X) / max(xsize, 1));
-    int by = (int)(((long long)j * STAGE2_BIN_GRID_Y) / max(ysize, 1));
+    int bx = i / STAGE2_BIN_TILE_W;
+    int by = j / STAGE2_BIN_TILE_H;
     if (bx < 0) bx = 0;
     if (by < 0) by = 0;
-    if (bx >= STAGE2_BIN_GRID_X) bx = STAGE2_BIN_GRID_X - 1;
-    if (by >= STAGE2_BIN_GRID_Y) by = STAGE2_BIN_GRID_Y - 1;
-    return by * STAGE2_BIN_GRID_X + bx;
+    if (bx >= bin_grid_x) bx = bin_grid_x - 1;
+    if (by >= bin_grid_y) by = bin_grid_y - 1;
+    return by * bin_grid_x + bx;
 }
 
 __global__ void k_bin_majority_residues(const int *__restrict__ d_majority,
@@ -426,7 +430,8 @@ __global__ void k_bin_majority_residues(const int *__restrict__ d_majority,
                                         int *__restrict__ d_bin_counts,
                                         int *__restrict__ d_bin_items,
                                         int *__restrict__ d_overflow,
-                                        int xsize, int ysize)
+                                        int xsize, int ysize,
+                                        int bin_grid_x, int bin_grid_y)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_maj) return;
@@ -434,7 +439,7 @@ __global__ void k_bin_majority_residues(const int *__restrict__ d_majority,
     const int enc = d_majority[1 + t];
     int i, j;
     decode_ij(enc, i, j);
-    const int bid = stage2_bin_id_from_xy(i, j, xsize, ysize);
+    const int bid = stage2_bin_id_from_xy(i, j, bin_grid_x, bin_grid_y);
     const int slot = atomicAdd(&d_bin_counts[bid], 1);
     if (slot < STAGE2_BIN_CAP) {
         d_bin_items[bid * STAGE2_BIN_CAP + slot] = enc;
@@ -449,7 +454,8 @@ __global__ void k_match_residues_fixed_bins(const int *__restrict__ d_minority,
                                             const int *__restrict__ d_bin_counts,
                                             const int *__restrict__ d_bin_items,
                                             int *__restrict__ d_pairs,
-                                            int xsize, int ysize)
+                                            int xsize, int ysize,
+                                            int bin_grid_x, int bin_grid_y)
 {
     const int min_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (min_idx >= n_min) return;
@@ -458,20 +464,20 @@ __global__ void k_match_residues_fixed_bins(const int *__restrict__ d_minority,
     int mi, mj;
     decode_ij(my_enc, mi, mj);
 
-    const int my_bid = stage2_bin_id_from_xy(mi, mj, xsize, ysize);
-    const int my_bx = my_bid % STAGE2_BIN_GRID_X;
-    const int my_by = my_bid / STAGE2_BIN_GRID_X;
+    const int my_bid = stage2_bin_id_from_xy(mi, mj, bin_grid_x, bin_grid_y);
+    const int my_bx = my_bid % bin_grid_x;
+    const int my_by = my_bid / bin_grid_x;
 
     int best_d2 = INT_MAX;
     int best_enc = -1;
 
     for (int dy = -STAGE2_BIN_SEARCH_RADIUS; dy <= STAGE2_BIN_SEARCH_RADIUS; ++dy) {
         const int by = my_by + dy;
-        if ((unsigned)by >= (unsigned)STAGE2_BIN_GRID_Y) continue;
+        if ((unsigned)by >= (unsigned)bin_grid_y) continue;
         for (int dx = -STAGE2_BIN_SEARCH_RADIUS; dx <= STAGE2_BIN_SEARCH_RADIUS; ++dx) {
             const int bx = my_bx + dx;
-            if ((unsigned)bx >= (unsigned)STAGE2_BIN_GRID_X) continue;
-            const int bid = by * STAGE2_BIN_GRID_X + bx;
+            if ((unsigned)bx >= (unsigned)bin_grid_x) continue;
+            const int bid = by * bin_grid_x + bx;
             int count = d_bin_counts[bid];
             if (count > STAGE2_BIN_CAP) count = STAGE2_BIN_CAP;
 
@@ -1063,16 +1069,16 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
         dim3 grid = residue_grid(xsize, ysize);
 
         cudaEventRecord(t0, 0);
-        k_pack_residues<<<grid, block>>>(dev->d_bitflags,
-                                         dev->d_pos_residues,
-                                         dev->d_neg_residues,
-                                         xsize, ysize);
+        k_pack_residues_and_mark_cuts<<<grid, block>>>(dev->d_bitflags,
+                                                    dev->d_pos_residues,
+                                                    dev->d_neg_residues,
+                                                    xsize, ysize);
         cudaEventRecord(t1, 0);
         cudaEventSynchronize(t1);
-        print_cuda_interval("Stage2 k_pack_residues", t0, t1);
+        print_cuda_interval("Stage2 k_pack_residues+mark_cuts", t0, t1);
 
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_pack_residues");
+            cuda_fail(e, "k_pack_residues_and_mark_cuts");
             cudaEventDestroy(t0); cudaEventDestroy(t1);
             return;
         }
@@ -1130,7 +1136,9 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     int *d_bin_overflow = NULL;
 
 #if STAGE2_USE_FIXED_BINS
-    const int n_bins = STAGE2_BIN_GRID_X * STAGE2_BIN_GRID_Y;
+    const int bin_grid_x = div_up_int(xsize, STAGE2_BIN_TILE_W);
+    const int bin_grid_y = div_up_int(ysize, STAGE2_BIN_TILE_H);
+    const int n_bins = bin_grid_x * bin_grid_y;
     cudaEventRecord(t0, 0);
     e = cudaMalloc((void **)&d_bin_counts, (size_t)n_bins * sizeof(int));
     if (e == cudaSuccess)
@@ -1159,7 +1167,8 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
         k_bin_majority_residues<<<blocks, threads>>>(d_maj, n_maj,
                                                      d_bin_counts, d_bin_items,
                                                      d_bin_overflow,
-                                                     xsize, ysize);
+                                                     xsize, ysize,
+                                                     bin_grid_x, bin_grid_y);
         cudaEventRecord(t1, 0);
         cudaEventSynchronize(t1);
         print_cuda_interval("Stage2 k_bin_majority", t0, t1);
@@ -1178,9 +1187,9 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     cudaEventSynchronize(t1);
     print_cuda_interval("Stage2 D2H bin overflow", t0, t1);
     if (e == cudaSuccess) {
-        printf("  [GPU][Stage2] fixed bins: grid=%dx%d cap=%d search_radius=%d overflow=%d\n",
-               STAGE2_BIN_GRID_X, STAGE2_BIN_GRID_Y, STAGE2_BIN_CAP,
-               STAGE2_BIN_SEARCH_RADIUS, h_bin_overflow);
+        printf("  [GPU][Stage2] fixed bins: tile=%dx%d grid=%dx%d cap=%d search_radius=%d overflow=%d\n",
+               STAGE2_BIN_TILE_W, STAGE2_BIN_TILE_H, bin_grid_x, bin_grid_y,
+               STAGE2_BIN_CAP, STAGE2_BIN_SEARCH_RADIUS, h_bin_overflow);
     } else {
         cuda_fail(e, "D2H bin overflow");
     }
@@ -1194,7 +1203,8 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
 #if STAGE2_USE_FIXED_BINS
         k_match_residues_fixed_bins<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
                                                          d_bin_counts, d_bin_items,
-                                                         dev->d_pairs, xsize, ysize);
+                                                         dev->d_pairs, xsize, ysize,
+                                                         bin_grid_x, bin_grid_y);
 #else
         k_match_residues<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
                                               dev->d_pairs, xsize, ysize);
@@ -1263,23 +1273,7 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
         }
     }
 
-    /* Safety/correctness fix: Goldstein cuts must include residue endpoints. */
-    {
-        const int threads = STAGE2_GROW_THREADS;
-        const int blocks  = (length + threads - 1) / threads;
-
-        cudaEventRecord(t0, 0);
-        k_mark_residues_as_branch_cuts<<<blocks, threads>>>(dev->d_bitflags, length);
-        cudaEventRecord(t1, 0);
-        cudaEventSynchronize(t1);
-        print_cuda_interval("Stage2 k_mark_residues_as_cuts", t0, t1);
-
-        if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_mark_residues_as_branch_cuts");
-            cudaEventDestroy(t0); cudaEventDestroy(t1);
-            return;
-        }
-    }
+    /* Residue endpoint marking is fused into k_pack_residues_and_mark_cuts. */
 
     /* ---- Stage 2 diagnostics: verify that residues are covered by cuts. -- */
     cudaEventRecord(t0, 0);
