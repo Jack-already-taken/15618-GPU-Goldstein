@@ -45,14 +45,6 @@ __device__ __forceinline__ float device_gradient(float p1, float p2)
     return r;
 }
 
-__device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
-{
-    unsigned int *word = (unsigned int*)(flags + (idx & ~3));
-    unsigned int bit   = (unsigned int)kUnwrapped << ((idx & 3) * 8);
-    unsigned int old   = atomicOr(word, bit);
-    return !(old & bit);
-}
-
 // __global__ void k_identify_residues(const float *phase, unsigned char *bitflags, int xsize,
 //                                     int ysize, int *d_num_res)
 // {
@@ -87,8 +79,8 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
  *
  * Stage 1 uses a 2D tile and shared-memory halo for residue detection.
  * Stage 2 uses 1D thread blocks for residue packing and cluster growth.
- * Stage 3 uses 1D thread blocks for BFS expansion and a 2D tile for the
- * final AVOID-band fill pass.
+ * Stage 3 uses tile-independent local unwrap, tile-height stitching,
+ * and a 2D tile for the final AVOID-band fill pass.
  * ----------------------------------------------------------------------- */
 #ifndef STAGE1_RESIDUE_TILE_W
 #define STAGE1_RESIDUE_TILE_W 16
@@ -133,7 +125,7 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_BIN_TILE_H 64
 #endif
 #ifndef STAGE2_BIN_CAP
-#define STAGE2_BIN_CAP 128
+#define STAGE2_BIN_CAP 32
 #endif
 #ifndef STAGE2_BIN_SEARCH_RADIUS
 #define STAGE2_BIN_SEARCH_RADIUS 2
@@ -144,20 +136,8 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_BIN_FALLBACK_FULL_SCAN 0
 #endif
 
-#ifndef STAGE3_FAST_GPU_BFS
-/* 0 = exact CPU-order frontier fallback.
-   1 = experimental fast GPU BFS. */
-#define STAGE3_FAST_GPU_BFS 0
-#endif
-
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 
-#ifndef STAGE3_BFS_THREADS
-#define STAGE3_BFS_THREADS 256
-#endif
-#ifndef STAGE3_MAX_BFS_ROUNDS
-#define STAGE3_MAX_BFS_ROUNDS 20000
-#endif
 #ifndef STAGE3_AVOID_TILE_W
 #define STAGE3_AVOID_TILE_W 16
 #endif
@@ -1177,73 +1157,9 @@ __global__ void k_apply_tile_offsets(float *soln,
     if (tile_known[tid]) soln[k] += tile_offsets[tid];
 }
 
-
-
-__global__ void k_bfs_expand(const float        *phase,
-                              unsigned char      *bitflags,
-                              float              *soln,
-                              const float        *gradx,
-                              const float        *grady,
-                              const int          *d_in,
-                              int                 n_in,
-                              int                *d_out,
-                              int                *n_out,
-                              int                 xsize,
-                              int                 ysize)
-{
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n_in) return;
-
-    const int kk  = d_in[t];
-    const int x   = kk % xsize;
-    const int y   = kk / xsize;
-    const float val = soln[kk];
-
-    /* left */
-    if (x - 1 >= 0) {
-        const int nb = kk - 1;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val + gradx[nb];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
-    }
-    /* right */
-    if (x + 1 < xsize) {
-        const int nb = kk + 1;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val - gradx[kk];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
-    }
-    /* up */
-    if (y - 1 >= 0) {
-        const int nb = kk - xsize;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val + grady[nb];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
-    }
-    /* down */
-    if (y + 1 < ysize) {
-        const int nb = kk + xsize;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val - grady[kk];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
-    }
-}
-
 /* -----------------------------------------------------------------------
  * Stage 3 kernel 3: AVOID-band fill (branch cuts + border pixels)
- * Same logic as the CPU serial AVOID pass — run once after BFS converges.
+ * Same logic as the CPU serial AVOID pass — run once after tile stitching.
  * One thread per pixel; only acts on pixels with kAvoid set.
  * ----------------------------------------------------------------------- */
 __global__ void k_avoid_fill(const float   *phase,
@@ -1336,17 +1252,6 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
     e = cudaMalloc((void **)&out->d_grady, (size_t)length * sizeof(float));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
-    e = cudaMalloc((void **)&out->d_frontier_a, (size_t)length * sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_b, (size_t)length * sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_count_a, sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_count_b, sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
     return 0;
 }
@@ -1364,10 +1269,6 @@ extern "C" void unwrap_cuda_device_bufs_free(UnwrapCudaDeviceBufs *buf)
     cudaFree(buf->d_pairs);
     cudaFree(buf->d_gradx);
     cudaFree(buf->d_grady);
-    cudaFree(buf->d_frontier_a);
-    cudaFree(buf->d_frontier_b);
-    cudaFree(buf->d_frontier_count_a);
-    cudaFree(buf->d_frontier_count_b);
     memset(buf, 0, sizeof(*buf));
 }
 
@@ -1735,21 +1636,11 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         return;
     }
 
-    printf("  [GPU][Stage3 timing] begin (tile four-direction floodfill, robust GPU vote stitch)\n");
+    printf("  [GPU][Stage3 timing] begin (tile-independent four-direction unwrap, robust GPU vote stitch)\n");
     fflush(stdout);
 
-    cudaError_t e;
+    cudaError_t e = cudaSuccess;
     cudaEvent_t t0 = nullptr, t1 = nullptr, total0 = nullptr, total1 = nullptr;
-    e = cudaEventCreate(&t0);
-    if (cuda_fail(e, "Stage3 create event t0")) goto cleanup;
-    e = cudaEventCreate(&t1);
-    if (cuda_fail(e, "Stage3 create event t1")) goto cleanup;
-    e = cudaEventCreate(&total0);
-    if (cuda_fail(e, "Stage3 create event total0")) goto cleanup;
-    e = cudaEventCreate(&total1);
-    if (cuda_fail(e, "Stage3 create event total1")) goto cleanup;
-    e = cudaEventRecord(total0, 0);
-    if (cuda_fail(e, "Stage3 record total0")) goto cleanup;
 
     const int tiles_x = div_up_int(xsize, STAGE3_TILE_W);
     const int tiles_y = div_up_int(ysize, STAGE3_TILE_H);
@@ -1763,6 +1654,17 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int *d_tile_known = nullptr;
     int *d_changed = nullptr;
     float *d_tile_offsets = nullptr;
+
+    e = cudaEventCreate(&t0);
+    if (cuda_fail(e, "Stage3 create event t0")) goto cleanup;
+    e = cudaEventCreate(&t1);
+    if (cuda_fail(e, "Stage3 create event t1")) goto cleanup;
+    e = cudaEventCreate(&total0);
+    if (cuda_fail(e, "Stage3 create event total0")) goto cleanup;
+    e = cudaEventCreate(&total1);
+    if (cuda_fail(e, "Stage3 create event total1")) goto cleanup;
+    e = cudaEventRecord(total0, 0);
+    if (cuda_fail(e, "Stage3 record total0")) goto cleanup;
 
     e = cudaMalloc((void **)&d_tile_known, (size_t)ntiles * sizeof(int));
     if (cuda_fail(e, "Stage3 malloc tile_known")) goto cleanup;
@@ -1869,7 +1771,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     cudaEventRecord(total1, 0);
     cudaEventSynchronize(total1);
     print_cuda_interval("Stage3 tile total", total0, total1);
-    printf("  [GPU] Stage3 tile fourdir+GPU-vote-stitch: tile=%dx%d tiles=%dx%d relax_iters=%d/%d min_support=%d majority=%d\n",
+    printf("  [GPU] Stage3 tile-independent fourdir+GPU-vote-stitch: tile=%dx%d tiles=%dx%d relax_iters=%d/%d min_support=%d majority=%d\n",
            STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y, relax_iter, max_relax,
            STAGE3_STITCH_MIN_SUPPORT, STAGE3_STITCH_REQUIRE_MAJORITY);
 
