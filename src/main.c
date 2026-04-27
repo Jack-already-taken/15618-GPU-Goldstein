@@ -1632,8 +1632,6 @@ double goldstein_phase_unwrapping(const char *input_path,
     }
 
     verify_effective = verify_serial;
-    if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
-        verify_effective = 0;  /* max-perf CUDA path keeps intermediate data on device */
 
     /* ---- For TIFF inputs load now to discover dimensions ---- */
     float *img_phase = NULL;
@@ -1699,16 +1697,11 @@ double goldstein_phase_unwrapping(const char *input_path,
     _t1 = clock();
     ms_bitflags_init = timediff(_t0, _t1);
 
-    /* ---- Pre-compute x/y gradients ----
-       CUDA max-perf path computes gradx/grady in the fused Stage-1 kernel. */
-    if (unwrap_backend != UNWRAP_BACKEND_CUDA_STUB) {
-        _t0 = clock();
-        Gradxy(phase, gradx, grady, xsize, ysize);
-        _t1 = clock();
-        ms_gradxy = timediff(_t0, _t1);
-    } else {
-        ms_gradxy = 0.0;
-    }
+    /* ---- Pre-compute x/y gradients ---- */
+    _t0 = clock();
+    Gradxy(phase, gradx, grady, xsize, ysize);
+    _t1 = clock();
+    ms_gradxy = timediff(_t0, _t1);
 
     MaxCutLen = (xsize + ysize) / 2;
 
@@ -1783,10 +1776,7 @@ double goldstein_phase_unwrapping(const char *input_path,
             unwrap_cuda_device_bufs_free(&kctx.cuda_dev);
     }
 
-    if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
-        printf("Number of residues: device-resident (host count intentionally not copied)\n");
-    else
-        printf("Number of residues: %d\n", NumRes);
+    printf("Number of residues: %d\n", NumRes);
 
     if (verify_effective) {
         _t0 = clock();

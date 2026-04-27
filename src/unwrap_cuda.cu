@@ -34,27 +34,14 @@ static void print_cuda_interval(const char *name, cudaEvent_t start, cudaEvent_t
 }
 
 
-// __device__ __forceinline__ float device_gradient(float p1, float p2)
-// {
-//     float r = p1 - p2;
-//     if (r > (float)PI)
-//         r -= (float)TWOPI;
-//     else if (r < -(float)PI)
-//         r += (float)TWOPI;
-//     return r;
-// }
-
 __device__ __forceinline__ float device_gradient(float p1, float p2)
 {
-    const float PI_F    = (float)PI;
-    const float TWOPI_F = (float)TWOPI;
-
     float r = p1 - p2;
-
-    // corr = +1 if r < -pi, -1 if r > pi, 0 otherwise
-    float corr = (float)(r < -PI_F) - (float)(r > PI_F);
-
-    return __fmaf_rn(TWOPI_F, corr, r);
+    if (r > (float)PI)
+        r -= (float)TWOPI;
+    else if (r < -(float)PI)
+        r += (float)TWOPI;
+    return r;
 }
 
 __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
@@ -171,7 +158,7 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #define STAGE3_TILE_H 32
 #endif
 #ifndef STAGE3_TILE_LOCAL_MAX_RESTARTS
-#define STAGE3_TILE_LOCAL_MAX_RESTARTS 1
+#define STAGE3_TILE_LOCAL_MAX_RESTARTS 16
 #endif
 #ifndef STAGE3_TILE_RELAX_MAX_ITERS
 #define STAGE3_TILE_RELAX_MAX_ITERS 4096
@@ -198,16 +185,8 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #define STAGE3_STITCH_REQUIRE_MAJORITY 1
 #endif
 
-__global__ void k_identify_residues_pack_grad(const float *phase,
-                                                    unsigned char *bitflags,
-                                                    float *gradx,
-                                                    float *grady,
-                                                    int xsize,
-                                                    int ysize,
-                                                    int residue_capacity,
-                                                    int *pos_residues,
-                                                    int *neg_residues,
-                                                    int *d_num_res)
+__global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
+                                    int xsize, int ysize, int *d_num_res)
 {
     __shared__ float s[STAGE1_RESIDUE_TILE_H + 1][STAGE1_RESIDUE_TILE_W + 1];
 
@@ -216,6 +195,8 @@ __global__ void k_identify_residues_pack_grad(const float *phase,
     const int i  = blockIdx.x * STAGE1_RESIDUE_TILE_W + tx;
     const int j  = blockIdx.y * STAGE1_RESIDUE_TILE_H + ty;
 
+    /* Load (TILE_H+1) x (TILE_W+1) patch — every thread loads its own cell,
+       edge threads also load the +1 halo column / row */
     if (i < xsize && j < ysize)
         s[ty][tx] = phase[j * xsize + i];
 
@@ -225,43 +206,21 @@ __global__ void k_identify_residues_pack_grad(const float *phase,
     if (ty == STAGE1_RESIDUE_TILE_H - 1 && j + 1 < ysize && i < xsize)
         s[ty + 1][tx] = phase[(j + 1) * xsize + i];
 
-    if (tx == STAGE1_RESIDUE_TILE_W - 1 && ty == STAGE1_RESIDUE_TILE_H - 1 &&
-        i + 1 < xsize && j + 1 < ysize)
+    if (tx == STAGE1_RESIDUE_TILE_W - 1 && ty == STAGE1_RESIDUE_TILE_H - 1 && i + 1 < xsize && j + 1 < ysize)
         s[ty + 1][tx + 1] = phase[(j + 1) * xsize + (i + 1)];
 
     __syncthreads();
 
-    if (i >= xsize || j >= ysize)
-        return;
-
-    const int k = j * xsize + i;
-
-    /* Stage 3 gradient generation is fused here so Stage 3 no longer launches
-       k_compute_unwrap_gradients nor reloads phase/bitflags from host.  The
-       sign convention matches the old k_compute_unwrap_gradients kernel. */
-    const float p00 = s[ty][tx];
-    if (i + 1 < xsize) {
-        const float px = s[ty][tx + 1];
-        gradx[k] = device_gradient(p00, px);
-    } else {
-        gradx[k] = 0.0f;
-    }
-    if (j + 1 < ysize) {
-        const float py = s[ty + 1][tx];
-        grady[k] = device_gradient(p00, py);
-    } else {
-        grady[k] = 0.0f;
-    }
-
     if (i >= xsize - 1 || j >= ysize - 1)
         return;
 
+    const int k = j * xsize + i;
     constexpr unsigned char avoid = kBranchCut | kBorder;
-    const unsigned char b00 = bitflags[k];
-    if ((b00 & avoid) || (bitflags[k + 1] & avoid) ||
-        (bitflags[k + 1 + xsize] & avoid) || (bitflags[k + xsize] & avoid))
+    if ((bitflags[k] & avoid) || (bitflags[k + 1] & avoid)
+        || (bitflags[k + 1 + xsize] & avoid) || (bitflags[k + xsize] & avoid))
         return;
 
+    const float p00 = s[ty    ][tx    ];
     const float p10 = s[ty    ][tx + 1];
     const float p11 = s[ty + 1][tx + 1];
     const float p01 = s[ty + 1][tx    ];
@@ -272,24 +231,12 @@ __global__ void k_identify_residues_pack_grad(const float *phase,
                   + device_gradient(p00, p01);
 
     const float thr = static_cast<float>(RESIDUE_THRESHOLD);
-    unsigned char out = b00;
-
-    if (r > thr) {
-        out = (unsigned char)(out | kPosRes | kBranchCut);
-        const int idx = atomicAdd(&pos_residues[0], 1);
-        if (idx < residue_capacity)
-            pos_residues[1 + idx] = ((j << 16) | (i & 0xFFFF));
+    if (r > thr)        bitflags[k] |= kPosRes;
+    else if (r < -thr)  bitflags[k] |= kNegRes;
+    if (r * r > thr * thr)
         atomicAdd(d_num_res, 1);
-    } else if (r < -thr) {
-        out = (unsigned char)(out | kNegRes | kBranchCut);
-        const int idx = atomicAdd(&neg_residues[0], 1);
-        if (idx < residue_capacity)
-            neg_residues[1 + idx] = ((j << 16) | (i & 0xFFFF));
-        atomicAdd(d_num_res, 1);
-    }
-
-    bitflags[k] = out;
 }
+
 
 /* ------------------------------------------------------------------------- */
 /*  (i, j) encoding helpers                                                  */
@@ -611,250 +558,6 @@ __global__ void k_match_residues_fixed_bins(const int *__restrict__ d_minority,
 
     d_pairs[2 * min_idx    ] = my_enc;
     d_pairs[2 * min_idx + 1] = best_enc;
-}
-
-
-__device__ __forceinline__ int clamped_residue_count(const int *a, int cap)
-{
-    int n = a[0];
-    if (n < 0) n = 0;
-    if (n > cap) n = cap;
-    return n;
-}
-
-__device__ __forceinline__ void select_min_majority_arrays(
-    const int *pos_residues,
-    const int *neg_residues,
-    int cap,
-    const int **d_min,
-    const int **d_maj,
-    int *n_min,
-    int *n_maj)
-{
-    const int n_pos = clamped_residue_count(pos_residues, cap);
-    const int n_neg = clamped_residue_count(neg_residues, cap);
-    if (n_pos <= n_neg) {
-        *d_min = pos_residues;
-        *d_maj = neg_residues;
-        *n_min = n_pos;
-        *n_maj = n_neg;
-    } else {
-        *d_min = neg_residues;
-        *d_maj = pos_residues;
-        *n_min = n_neg;
-        *n_maj = n_pos;
-    }
-}
-
-__global__ void k_bin_majority_residues_auto(const int *__restrict__ pos_residues,
-                                             const int *__restrict__ neg_residues,
-                                             int cap,
-                                             int *__restrict__ d_bin_counts,
-                                             int *__restrict__ d_bin_items,
-                                             int *__restrict__ d_overflow,
-                                             int xsize,
-                                             int ysize)
-{
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    const int *d_min;
-    const int *d_maj;
-    int n_min, n_maj;
-    select_min_majority_arrays(pos_residues, neg_residues, cap,
-                               &d_min, &d_maj, &n_min, &n_maj);
-    (void)d_min;
-    (void)n_min;
-    if (t >= n_maj) return;
-
-    const int enc = d_maj[1 + t];
-    int i, j;
-    decode_ij(enc, i, j);
-    const int bid = stage2_bin_id_from_xy(i, j, xsize, ysize);
-    const int slot = atomicAdd(&d_bin_counts[bid], 1);
-    if (slot < STAGE2_BIN_CAP)
-        d_bin_items[bid * STAGE2_BIN_CAP + slot] = enc;
-    else
-        atomicAdd(d_overflow, 1);
-}
-
-__global__ void k_match_residues_fixed_bins_auto(const int *__restrict__ pos_residues,
-                                                 const int *__restrict__ neg_residues,
-                                                 int cap,
-                                                 const int *__restrict__ d_bin_counts,
-                                                 const int *__restrict__ d_bin_items,
-                                                 int *__restrict__ d_pairs,
-                                                 int xsize,
-                                                 int ysize)
-{
-    const int min_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int *d_min;
-    const int *d_maj;
-    int n_min, n_maj;
-    select_min_majority_arrays(pos_residues, neg_residues, cap,
-                               &d_min, &d_maj, &n_min, &n_maj);
-    if (min_idx >= n_min) return;
-
-    const int my_enc = d_min[1 + min_idx];
-    int mi, mj;
-    decode_ij(my_enc, mi, mj);
-
-    const int my_bid = stage2_bin_id_from_xy(mi, mj, xsize, ysize);
-    const int my_bx = my_bid % STAGE2_BIN_GRID_X;
-    const int my_by = my_bid / STAGE2_BIN_GRID_X;
-
-    int best_d2 = INT_MAX;
-    int best_enc = -1;
-
-    for (int dy = -STAGE2_BIN_SEARCH_RADIUS; dy <= STAGE2_BIN_SEARCH_RADIUS; ++dy) {
-        const int by = my_by + dy;
-        if ((unsigned)by >= (unsigned)STAGE2_BIN_GRID_Y) continue;
-        for (int dx = -STAGE2_BIN_SEARCH_RADIUS; dx <= STAGE2_BIN_SEARCH_RADIUS; ++dx) {
-            const int bx = my_bx + dx;
-            if ((unsigned)bx >= (unsigned)STAGE2_BIN_GRID_X) continue;
-            const int bid = by * STAGE2_BIN_GRID_X + bx;
-            int count = d_bin_counts[bid];
-            if (count > STAGE2_BIN_CAP) count = STAGE2_BIN_CAP;
-
-            for (int k = 0; k < count; ++k) {
-                const int enc = d_bin_items[bid * STAGE2_BIN_CAP + k];
-                int pi, pj;
-                decode_ij(enc, pi, pj);
-                const int di = pi - mi;
-                const int dj = pj - mj;
-                const int d2 = di * di + dj * dj;
-                if (d2 < best_d2) {
-                    best_d2 = d2;
-                    best_enc = enc;
-                }
-            }
-        }
-    }
-
-#if STAGE2_BIN_FALLBACK_FULL_SCAN
-    if (best_enc < 0) {
-        for (int m = 0; m < n_maj; ++m) {
-            const int enc = d_maj[1 + m];
-            int pi, pj;
-            decode_ij(enc, pi, pj);
-            const int di = pi - mi;
-            const int dj = pj - mj;
-            const int d2 = di * di + dj * dj;
-            if (d2 < best_d2) {
-                best_d2 = d2;
-                best_enc = enc;
-            }
-        }
-    }
-#endif
-
-    if (best_enc < 0)
-        best_enc = nearest_edge_enc(mi, mj, xsize, ysize);
-
-    d_pairs[2 * min_idx    ] = my_enc;
-    d_pairs[2 * min_idx + 1] = best_enc;
-}
-
-__global__ void k_match_residues_auto_scan(const int *__restrict__ pos_residues,
-                                           const int *__restrict__ neg_residues,
-                                           int cap,
-                                           int *__restrict__ d_pairs,
-                                           int xsize,
-                                           int ysize)
-{
-    const int min_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int *d_min;
-    const int *d_maj;
-    int n_min, n_maj;
-    select_min_majority_arrays(pos_residues, neg_residues, cap,
-                               &d_min, &d_maj, &n_min, &n_maj);
-    if (min_idx >= n_min) return;
-
-    const int my_enc = d_min[1 + min_idx];
-    int mi, mj;
-    decode_ij(my_enc, mi, mj);
-
-    int best_d2 = INT_MAX;
-    int best_enc = -1;
-    for (int m = 0; m < n_maj; ++m) {
-        const int enc = d_maj[1 + m];
-        int pi, pj;
-        decode_ij(enc, pi, pj);
-        const int di = pi - mi;
-        const int dj = pj - mj;
-        const int d2 = di * di + dj * dj;
-        if (d2 < best_d2) {
-            best_d2 = d2;
-            best_enc = enc;
-        }
-    }
-
-    if (best_enc < 0)
-        best_enc = nearest_edge_enc(mi, mj, xsize, ysize);
-
-    d_pairs[2 * min_idx    ] = my_enc;
-    d_pairs[2 * min_idx + 1] = best_enc;
-}
-
-__global__ void k_fill_leftovers_auto(const int *__restrict__ pos_residues,
-                                      const int *__restrict__ neg_residues,
-                                      int cap,
-                                      int *__restrict__ d_pairs,
-                                      int xsize,
-                                      int ysize)
-{
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    const int *d_min;
-    const int *d_maj;
-    int n_min, n_maj;
-    select_min_majority_arrays(pos_residues, neg_residues, cap,
-                               &d_min, &d_maj, &n_min, &n_maj);
-    (void)d_min;
-
-    const int n_leftover = n_maj - n_min;
-    if (t >= n_leftover) return;
-
-    const int slot = n_min + t;
-    const int enc  = d_maj[1 + slot];
-    int i, j;
-    decode_ij(enc, i, j);
-
-    d_pairs[2 * slot    ] = enc;
-    d_pairs[2 * slot + 1] = nearest_edge_enc(i, j, xsize, ysize);
-}
-
-__global__ void k_rasterize_cuts_auto(const int *__restrict__ pos_residues,
-                                      const int *__restrict__ neg_residues,
-                                      int cap,
-                                      const int *__restrict__ d_pairs,
-                                      unsigned char *__restrict__ bitflags,
-                                      int xsize,
-                                      int ysize)
-{
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    const int n_pos = clamped_residue_count(pos_residues, cap);
-    const int n_neg = clamped_residue_count(neg_residues, cap);
-    const int n_pairs = (n_pos <= n_neg) ? n_neg : n_pos;
-    if (t >= n_pairs) return;
-
-    const int a = d_pairs[2 * t    ];
-    const int b = d_pairs[2 * t + 1];
-
-    int i0, j0, i1, j1;
-    decode_ij(a, i0, j0);
-    decode_ij(b, i1, j1);
-
-    int di =  abs(i1 - i0), si = (i0 < i1) ? 1 : -1;
-    int dj = -abs(j1 - j0), sj = (j0 < j1) ? 1 : -1;
-    int err = di + dj;
-
-    int i = i0, j = j0;
-    for (;;) {
-        if ((unsigned)i < (unsigned)xsize && (unsigned)j < (unsigned)ysize)
-            stamp_branch_cut(bitflags, xsize, i, j);
-        if (i == i1 && j == j1) break;
-        const int e2 = 2 * err;
-        if (e2 >= dj) { err += dj; i += si; }
-        if (e2 <= di) { err += di; j += sj; }
-    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1594,64 +1297,63 @@ extern "C" int unwrap_cuda_launch_residue_identification(
     float *h_phase, unsigned char *h_bitflags, const UnwrapCudaDeviceBufs *dev, int xsize, int ysize,
     int length)
 {
-    if (!h_phase || !h_bitflags || !dev || !dev->d_phase || !dev->d_bitflags ||
-        !dev->d_residue_count || !dev->d_pos_residues || !dev->d_neg_residues ||
-        !dev->d_gradx || !dev->d_grady || xsize < 2 || ysize < 2 || length != xsize * ysize)
+    if (!h_phase || !h_bitflags || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_residue_count
+        || xsize < 2 || ysize < 2 || length != xsize * ysize)
         return -1;
 
     cudaError_t e;
-    const int cap = residue_capacity(length);
+    int         h_count = 0;
 
-    /* Only H2D entry point for the CUDA pipeline.  After this launch, bitflags,
-       packed residues, and gradients stay resident on device until final D2H. */
     if ((e = cudaMemcpy(dev->d_phase, h_phase, (size_t)length * sizeof(float), cudaMemcpyHostToDevice))
         != cudaSuccess)
-        return cuda_fail(e, "Stage1 H2D phase");
-    if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags,
-                        (size_t)length * sizeof(unsigned char),
-                        cudaMemcpyHostToDevice)) != cudaSuccess)
-        return cuda_fail(e, "Stage1 H2D bitflags");
-
+        return cuda_fail(e, "H2D phase");
+    if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length * sizeof(unsigned char),
+                        cudaMemcpyHostToDevice))
+        != cudaSuccess)
+        return cuda_fail(e, "H2D bitflags");
     if ((e = cudaMemset(dev->d_residue_count, 0, sizeof(int))) != cudaSuccess)
-        return cuda_fail(e, "Stage1 memset total residue count");
-    if ((e = cudaMemset(dev->d_pos_residues, 0, sizeof(int))) != cudaSuccess)
-        return cuda_fail(e, "Stage1 memset pos residue count");
-    if ((e = cudaMemset(dev->d_neg_residues, 0, sizeof(int))) != cudaSuccess)
-        return cuda_fail(e, "Stage1 memset neg residue count");
+        return cuda_fail(e, "memset count");
+
+    // dim3 block(16, 16);
+    // dim3 grid = residue_grid(xsize, ysize);
 
     dim3 block(STAGE1_RESIDUE_TILE_W, STAGE1_RESIDUE_TILE_H);
     dim3 grid((xsize + STAGE1_RESIDUE_TILE_W - 1) / STAGE1_RESIDUE_TILE_W,
-              (ysize + STAGE1_RESIDUE_TILE_H - 1) / STAGE1_RESIDUE_TILE_H);
+          (ysize + STAGE1_RESIDUE_TILE_H - 1) / STAGE1_RESIDUE_TILE_H);
 
+    /* --- CUDA event timing --- */
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    k_identify_residues_pack_grad<<<grid, block>>>(dev->d_phase, dev->d_bitflags,
-                                                   dev->d_gradx, dev->d_grady,
-                                                   xsize, ysize, cap,
-                                                   dev->d_pos_residues,
-                                                   dev->d_neg_residues,
-                                                   dev->d_residue_count);
+    k_identify_residues<<<grid, block>>>(dev->d_phase, dev->d_bitflags, xsize, ysize,
+                                         dev->d_residue_count);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
-    float kernel_ms = 0.0f;
+    float kernel_ms = 0;
     cudaEventElapsedTime(&kernel_ms, start, stop);
-    printf("  [GPU] Stage1 fused residue+pack+grad: %.4f ms\n", kernel_ms);
+    printf("  [GPU] residue kernel only: %.4f ms\n", kernel_ms);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    /* --- end timing --- */
 
     if ((e = cudaGetLastError()) != cudaSuccess)
-        return cuda_fail(e, "k_identify_residues_pack_grad");
+        return cuda_fail(e, "k_identify_residues");
     if ((e = cudaDeviceSynchronize()) != cudaSuccess)
-        return cuda_fail(e, "sync fused residues");
+        return cuda_fail(e, "sync residues");
 
-    /* No D2H bitflags/count here. Stage 2 reads the device counters directly.
-       Return 0 as an intentional host-side placeholder. */
-    return 0;
+    if ((e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char),
+                        cudaMemcpyDeviceToHost))
+        != cudaSuccess)
+        return cuda_fail(e, "D2H bitflags");
+    if ((e = cudaMemcpy(&h_count, dev->d_residue_count, sizeof(int), cudaMemcpyDeviceToHost))
+        != cudaSuccess)
+        return cuda_fail(e, "D2H count");
+
+    return h_count;
 }
 
 extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
@@ -1659,12 +1361,11 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
                                                     int max_cut_len, int num_res,
                                                     int xsize, int ysize, int length)
 {
-    (void)h_bitflags;
     (void)max_cut_len;
     (void)num_res;
 
-    if (length < 1 || !dev || !dev->d_bitflags || !dev->d_pos_residues ||
-        !dev->d_neg_residues || !dev->d_pairs)
+    if (length < 1 || !h_bitflags || !dev || !dev->d_bitflags
+        || !dev->d_pos_residues || !dev->d_neg_residues || !dev->d_pairs)
         return;
     if (xsize >= 65536 || ysize >= 65536) {
         fprintf(stderr, "residue_matching: image too large for 16-bit encoding\n");
@@ -1672,116 +1373,257 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     }
 
     cudaError_t e;
-    cudaEvent_t t0 = nullptr, t1 = nullptr;
+    cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
 
-    const int cap = residue_capacity(length);
-    const int threads = STAGE2_GROW_THREADS;
-    const int blocks = (cap + threads - 1) / threads;
+    printf("  [GPU][Stage2 timing] begin\n");
 
-    printf("  [GPU][Stage2 timing] begin device-resident/no-verify path\n");
+    /* ---- H2D bitflags ---------------------------------------------------- */
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length,
+                   cudaMemcpyHostToDevice);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 H2D bitflags", t0, t1);
+    if (e != cudaSuccess) {
+        cuda_fail(e, "H2D bitflags");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
+    /* ---- Reset only the counter slots ------------------------------------ */
+    cudaEventRecord(t0, 0);
+    cudaMemsetAsync(dev->d_pos_residues, 0, sizeof(int));
+    cudaMemsetAsync(dev->d_neg_residues, 0, sizeof(int));
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 reset residue counters", t0, t1);
+
+    /* ---- Kernel 1: pack residues and mark residue endpoints as cuts ------- */
+    {
+        dim3 block(16, 16);
+        dim3 grid = residue_grid(xsize, ysize);
+
+        cudaEventRecord(t0, 0);
+        k_pack_residues_and_mark_cuts<<<grid, block>>>(dev->d_bitflags,
+                                                       dev->d_pos_residues,
+                                                       dev->d_neg_residues,
+                                                       xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_pack_residues+mark_cuts", t0, t1);
+
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_pack_residues_and_mark_cuts");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
+        }
+    }
+
+    int h_n_pos = 0, h_n_neg = 0;
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(&h_n_pos, dev->d_pos_residues, sizeof(int), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess)
+        e = cudaMemcpy(&h_n_neg, dev->d_neg_residues, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 D2H residue counts", t0, t1);
+    if (e != cudaSuccess) {
+        cuda_fail(e, "D2H residue counts");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
+    printf("  [GPU][Stage2] packed residues: pos=%d neg=%d\n", h_n_pos, h_n_neg);
+
+    if (h_n_pos == 0 && h_n_neg == 0) {
+        cudaEventRecord(t0, 0);
+        e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length,
+                       cudaMemcpyDeviceToHost);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 D2H bitflags", t0, t1);
+        if (e != cudaSuccess)
+            cuda_fail(e, "D2H bitflags");
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
+    const int cap = residue_capacity(length);
+    if (h_n_pos > cap || h_n_neg > cap) {
+        fprintf(stderr, "residue_matching: residue count exceeds capacity "
+                        "(pos=%d neg=%d cap=%d) — raise residue_capacity()\n",
+                h_n_pos, h_n_neg, cap);
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        return;
+    }
+
+    /* Pick minority vs majority. */
+    const int  n_min = (h_n_pos <= h_n_neg) ? h_n_pos : h_n_neg;
+    const int  n_maj = (h_n_pos <= h_n_neg) ? h_n_neg : h_n_pos;
+    int *const d_min = (h_n_pos <= h_n_neg) ? dev->d_pos_residues
+                                            : dev->d_neg_residues;
+    int *const d_maj = (h_n_pos <= h_n_neg) ? dev->d_neg_residues
+                                            : dev->d_pos_residues;
+
+    /* ---- Kernel 2: minority -> majority matching ------------------------- */
+    int *d_bin_counts = NULL;
+    int *d_bin_items = NULL;
+    int *d_bin_overflow = NULL;
 
 #if STAGE2_USE_FIXED_BINS
     const int n_bins = STAGE2_BIN_GRID_X * STAGE2_BIN_GRID_Y;
     if (!dev->d_bin_counts || !dev->d_bin_items || !dev->d_bin_overflow ||
-        dev->stage2_nbins < n_bins || dev->stage2_bin_items < n_bins * STAGE2_BIN_CAP) {
+        dev->stage2_nbins < n_bins ||
+        dev->stage2_bin_items < n_bins * STAGE2_BIN_CAP) {
         fprintf(stderr, "residue_matching: fixed-bin scratch buffers were not allocated correctly\n");
         cudaEventDestroy(t0); cudaEventDestroy(t1);
         return;
     }
 
+    d_bin_counts = dev->d_bin_counts;
+    d_bin_items = dev->d_bin_items;
+    d_bin_overflow = dev->d_bin_overflow;
+
     cudaEventRecord(t0, 0);
-    e = cudaMemsetAsync(dev->d_bin_counts, 0, (size_t)n_bins * sizeof(int));
+    e = cudaMemsetAsync(d_bin_counts, 0, (size_t)n_bins * sizeof(int));
     if (e == cudaSuccess)
-        e = cudaMemsetAsync(dev->d_bin_overflow, 0, sizeof(int));
-    k_bin_majority_residues_auto<<<blocks, threads>>>(dev->d_pos_residues,
-                                                      dev->d_neg_residues,
-                                                      cap,
-                                                      dev->d_bin_counts,
-                                                      dev->d_bin_items,
-                                                      dev->d_bin_overflow,
-                                                      xsize, ysize);
+        e = cudaMemsetAsync(d_bin_overflow, 0, sizeof(int));
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage2 reset+bin_majority_auto", t0, t1);
+    print_cuda_interval("Stage2 fixed-bin reset", t0, t1);
     if (e != cudaSuccess) {
         cuda_fail(e, "Stage2 fixed-bin reset");
         cudaEventDestroy(t0); cudaEventDestroy(t1);
         return;
     }
-    if ((e = cudaGetLastError()) != cudaSuccess) {
-        cuda_fail(e, "k_bin_majority_residues_auto");
-        cudaEventDestroy(t0); cudaEventDestroy(t1);
-        return;
+
+    if (n_maj > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks = (n_maj + threads - 1) / threads;
+        cudaEventRecord(t0, 0);
+        k_bin_majority_residues<<<blocks, threads>>>(d_maj, n_maj,
+                                                     d_bin_counts, d_bin_items,
+                                                     d_bin_overflow,
+                                                     xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_bin_majority", t0, t1);
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_bin_majority_residues");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
+        }
     }
 
+    int h_bin_overflow = 0;
     cudaEventRecord(t0, 0);
-    k_match_residues_fixed_bins_auto<<<blocks, threads>>>(dev->d_pos_residues,
-                                                          dev->d_neg_residues,
-                                                          cap,
-                                                          dev->d_bin_counts,
-                                                          dev->d_bin_items,
-                                                          dev->d_pairs,
-                                                          xsize, ysize);
+    e = cudaMemcpy(&h_bin_overflow, d_bin_overflow, sizeof(int), cudaMemcpyDeviceToHost);
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage2 k_match_fixed_bins_auto", t0, t1);
-    if ((e = cudaGetLastError()) != cudaSuccess) {
-        cuda_fail(e, "k_match_residues_fixed_bins_auto");
-        cudaEventDestroy(t0); cudaEventDestroy(t1);
-        return;
-    }
-#else
-    cudaEventRecord(t0, 0);
-    k_match_residues_auto_scan<<<blocks, threads>>>(dev->d_pos_residues,
-                                                    dev->d_neg_residues,
-                                                    cap,
-                                                    dev->d_pairs,
-                                                    xsize, ysize);
-    cudaEventRecord(t1, 0);
-    cudaEventSynchronize(t1);
-    print_cuda_interval("Stage2 k_match_residues_auto_scan", t0, t1);
-    if ((e = cudaGetLastError()) != cudaSuccess) {
-        cuda_fail(e, "k_match_residues_auto_scan");
-        cudaEventDestroy(t0); cudaEventDestroy(t1);
-        return;
+    print_cuda_interval("Stage2 D2H bin overflow", t0, t1);
+    if (e == cudaSuccess) {
+        printf("  [GPU][Stage2] fixed bins: grid=%dx%d cap=%d search_radius=%d overflow=%d\n",
+               STAGE2_BIN_GRID_X, STAGE2_BIN_GRID_Y, STAGE2_BIN_CAP,
+               STAGE2_BIN_SEARCH_RADIUS, h_bin_overflow);
+    } else {
+        cuda_fail(e, "D2H bin overflow");
     }
 #endif
 
-    cudaEventRecord(t0, 0);
-    k_fill_leftovers_auto<<<blocks, threads>>>(dev->d_pos_residues,
-                                               dev->d_neg_residues,
-                                               cap,
-                                               dev->d_pairs,
-                                               xsize, ysize);
-    cudaEventRecord(t1, 0);
-    cudaEventSynchronize(t1);
-    print_cuda_interval("Stage2 k_fill_leftovers_auto", t0, t1);
-    if ((e = cudaGetLastError()) != cudaSuccess) {
-        cuda_fail(e, "k_fill_leftovers_auto");
-        cudaEventDestroy(t0); cudaEventDestroy(t1);
-        return;
+    if (n_min > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (n_min + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
+#if STAGE2_USE_FIXED_BINS
+        k_match_residues_fixed_bins<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
+                                                         d_bin_counts, d_bin_items,
+                                                         dev->d_pairs, xsize, ysize);
+#else
+        k_match_residues<<<blocks, threads>>>(d_min, d_maj, n_min, n_maj,
+                                              dev->d_pairs, xsize, ysize);
+#endif
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+#if STAGE2_USE_FIXED_BINS
+        print_cuda_interval("Stage2 k_match_fixed_bins", t0, t1);
+#else
+        print_cuda_interval("Stage2 k_match_residues", t0, t1);
+#endif
+
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "Stage2 matching");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
+        }
     }
 
+    /* ---- Kernel 3: leftover majority -> edge ----------------------------- */
+    const int n_leftover = n_maj - n_min;
+    if (n_leftover > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (n_leftover + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
+        k_fill_leftovers<<<blocks, threads>>>(d_maj, n_min, n_leftover,
+                                              dev->d_pairs, xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_fill_leftovers", t0, t1);
+
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_fill_leftovers");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
+        }
+    } else {
+        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage2 k_fill_leftovers", 0.0f);
+    }
+
+    /* ---- Kernel 4: one rasterize pass over the combined buffer ----------- */
+    const int n_total = n_maj;  /* == n_min + n_leftover */
+    if (n_total > 0) {
+        const int threads = STAGE2_GROW_THREADS;
+        const int blocks  = (n_total + threads - 1) / threads;
+
+        cudaEventRecord(t0, 0);
+        k_rasterize_cuts<<<blocks, threads>>>(dev->d_pairs, n_total,
+                                              dev->d_bitflags, xsize, ysize);
+        cudaEventRecord(t1, 0);
+        cudaEventSynchronize(t1);
+        print_cuda_interval("Stage2 k_rasterize_cuts", t0, t1);
+
+        if ((e = cudaGetLastError()) != cudaSuccess) {
+            cuda_fail(e, "k_rasterize_cuts");
+            cudaEventDestroy(t0); cudaEventDestroy(t1);
+            return;
+        }
+    }
+
+    /* Residue endpoint marking is already fused into k_pack_residues_and_mark_cuts. */
+
+    /* ---- Stage 2 diagnostics: verify that residues are covered by cuts. -- */
     cudaEventRecord(t0, 0);
-    k_rasterize_cuts_auto<<<blocks, threads>>>(dev->d_pos_residues,
-                                               dev->d_neg_residues,
-                                               cap,
-                                               dev->d_pairs,
-                                               dev->d_bitflags,
-                                               xsize, ysize);
+    verify_stage2_branchcuts_device(dev, length, xsize, ysize);
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage2 k_rasterize_cuts_auto", t0, t1);
-    if ((e = cudaGetLastError()) != cudaSuccess)
-        cuda_fail(e, "k_rasterize_cuts_auto");
+    print_cuda_interval("Stage2 verify diagnostics total", t0, t1);
 
-    /* No D2H bitflags/counts and no verification diagnostics in max-perf mode. */
+    /* ---- D2H bitflags ---------------------------------------------------- */
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length,
+                   cudaMemcpyDeviceToHost);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage2 D2H bitflags", t0, t1);
+    if (e != cudaSuccess)
+        cuda_fail(e, "D2H bitflags");
+
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
 }
-
 extern "C" void unwrap_cuda_launch_unwrapping(
     float *h_phase,
     unsigned char *h_bitflags,
@@ -1865,10 +1707,10 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     memset(h_tile_offset_k, 0, (size_t)ntiles * sizeof(int));
 
     cudaEventRecord(t0, 0);
-    /* Device-resident handoff from Stage 2: do not recopy phase or bitflags.
-       Gradients were already produced by the fused Stage 1 kernel. */
-    (void)h_phase;
-    (void)h_bitflags;
+    e = cudaMemcpy(dev->d_phase, h_phase, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D phase")) goto cleanup;
+    e = cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D bitflags")) goto cleanup;
     e = cudaMemset(dev->d_soln, 0, (size_t)length * sizeof(float));
     if (cuda_fail(e, "Stage3 memset soln")) goto cleanup;
     {
@@ -1877,12 +1719,20 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         k_clear_unwrapped_flags<<<blocks, threads>>>(dev->d_bitflags, length);
         e = cudaGetLastError();
         if (cuda_fail(e, "k_clear_unwrapped_flags")) goto cleanup;
+    }
+    {
+        dim3 block(16, 16);
+        dim3 grid(div_up_int(xsize, (int)block.x), div_up_int(ysize, (int)block.y));
+        k_compute_unwrap_gradients<<<grid, block>>>(dev->d_phase, dev->d_gradx, dev->d_grady,
+                                                    xsize, ysize);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_compute_unwrap_gradients")) goto cleanup;
         e = cudaDeviceSynchronize();
-        if (cuda_fail(e, "sync Stage3 resident setup")) goto cleanup;
+        if (cuda_fail(e, "sync Stage3 H2D/gradients")) goto cleanup;
     }
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 resident setup", t0, t1);
+    print_cuda_interval("Stage3 H2D + GPU gradients", t0, t1);
 
     cudaEventRecord(t0, 0);
     {
@@ -2056,10 +1906,12 @@ extern "C" void unwrap_cuda_launch_unwrapping(
 
     cudaEventRecord(t0, 0);
     e = cudaMemcpy(h_soln, dev->d_soln, (size_t)length * sizeof(float), cudaMemcpyDeviceToHost);
-    if (cuda_fail(e, "Stage3 final D2H soln")) goto cleanup;
+    if (cuda_fail(e, "Stage3 D2H soln")) goto cleanup;
+    e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    if (cuda_fail(e, "Stage3 D2H bitflags")) goto cleanup;
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 final D2H soln", t0, t1);
+    print_cuda_interval("Stage3 D2H outputs", t0, t1);
 
     cudaEventRecord(total1, 0);
     cudaEventSynchronize(total1);
