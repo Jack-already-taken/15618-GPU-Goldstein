@@ -90,10 +90,10 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
  * and a 2D tile for the final AVOID-band fill pass.
  * ----------------------------------------------------------------------- */
 #ifndef STAGE1_RESIDUE_TILE_W
-#define STAGE1_RESIDUE_TILE_W 32
+#define STAGE1_RESIDUE_TILE_W 16
 #endif
 #ifndef STAGE1_RESIDUE_TILE_H
-#define STAGE1_RESIDUE_TILE_H 32
+#define STAGE1_RESIDUE_TILE_H 16
 #endif
 
 #ifndef STAGE2_PACK_THREADS
@@ -125,13 +125,13 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_USE_FIXED_BINS 1
 #endif
 #ifndef STAGE2_BIN_GRID_X
-#define STAGE2_BIN_GRID_X 64
+#define STAGE2_BIN_GRID_X 128
 #endif
 #ifndef STAGE2_BIN_GRID_Y
-#define STAGE2_BIN_GRID_Y 64
+#define STAGE2_BIN_GRID_Y 128
 #endif
 #ifndef STAGE2_BIN_CAP
-#define STAGE2_BIN_CAP 128
+#define STAGE2_BIN_CAP 32
 #endif
 #ifndef STAGE2_BIN_SEARCH_RADIUS
 #define STAGE2_BIN_SEARCH_RADIUS 2
@@ -224,34 +224,6 @@ __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
     if (r * r > thr * thr)
         atomicAdd(d_num_res, 1);
 }
-
-// __global__ void k_identify_residues(const float *phase, unsigned char *bitflags, int xsize,
-//                                     int ysize, int *d_num_res)
-// {
-//     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-//     const int j = blockIdx.y * blockDim.y + threadIdx.y;
-//     if (i >= xsize - 1 || j >= ysize - 1)
-//         return;
-
-//     const int                k = j * xsize + i;
-//     constexpr unsigned char avoid = kBranchCut | kBorder;
-//     if ((bitflags[k] & avoid) || (bitflags[k + 1] & avoid)
-//         || (bitflags[k + 1 + xsize] & avoid) || (bitflags[k + xsize] & avoid))
-//         return;
-
-//     const float r = device_gradient(phase[k + 1], phase[k])
-//                     + device_gradient(phase[k + 1 + xsize], phase[k + 1])
-//                     + device_gradient(phase[k + xsize], phase[k + 1 + xsize])
-//                     + device_gradient(phase[k], phase[k + xsize]);
-
-//     const float thr = static_cast<float>(RESIDUE_THRESHOLD);
-//     if (r > thr)
-//         bitflags[k] |= kPosRes;
-//     else if (r < -thr)
-//         bitflags[k] |= kNegRes;
-//     if (r * r > thr * thr)
-//         atomicAdd(d_num_res, 1);
-// }
 
 
 /* ------------------------------------------------------------------------- */
@@ -1220,6 +1192,8 @@ extern "C" int unwrap_cuda_launch_residue_identification(
     if ((e = cudaMemset(dev->d_residue_count, 0, sizeof(int))) != cudaSuccess)
         return cuda_fail(e, "memset count");
 
+    // dim3 block(16, 16);
+    // dim3 grid = residue_grid(xsize, ysize);
 
     dim3 block(STAGE1_RESIDUE_TILE_W, STAGE1_RESIDUE_TILE_H);
     dim3 grid((xsize + STAGE1_RESIDUE_TILE_W - 1) / STAGE1_RESIDUE_TILE_W,
@@ -1543,9 +1517,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int ysize,
     int length)
 {
-    printf("  [GPU][Stage3 timing] begin (tile-independent unwrap + tile-graph height stitching111)\n");
-    // (void)h_gradx;
-    // (void)h_grady;
+    (void)h_gradx;
+    (void)h_grady;
 
     if (!h_phase || !h_bitflags || !h_soln
         || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
