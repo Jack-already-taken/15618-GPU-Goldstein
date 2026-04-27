@@ -86,8 +86,8 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
  *
  * Stage 1 uses a 2D tile and shared-memory halo for residue detection.
  * Stage 2 uses 1D thread blocks for residue packing and cluster growth.
- * Stage 3 uses 1D thread blocks for BFS expansion and a 2D tile for the
- * final AVOID-band fill pass.
+ * Stage 3 uses tile-independent local unwrap, tile-graph height stitching,
+ * and a 2D tile for the final AVOID-band fill pass.
  * ----------------------------------------------------------------------- */
 #ifndef STAGE1_RESIDUE_TILE_W
 #define STAGE1_RESIDUE_TILE_W 16
@@ -142,25 +142,35 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_BIN_FALLBACK_FULL_SCAN 0
 #endif
 
-#ifndef STAGE3_FAST_GPU_BFS
-/* 0 = exact CPU-order frontier fallback.
-   1 = experimental fast GPU BFS. */
-#define STAGE3_FAST_GPU_BFS 0
-#endif
-
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 
-#ifndef STAGE3_BFS_THREADS
-#define STAGE3_BFS_THREADS 256
-#endif
-#ifndef STAGE3_MAX_BFS_ROUNDS
-#define STAGE3_MAX_BFS_ROUNDS 20000
-#endif
 #ifndef STAGE3_AVOID_TILE_W
 #define STAGE3_AVOID_TILE_W 16
 #endif
 #ifndef STAGE3_AVOID_TILE_H
 #define STAGE3_AVOID_TILE_H 16
+#endif
+
+#ifndef STAGE3_TILE_W
+#define STAGE3_TILE_W 32
+#endif
+#ifndef STAGE3_TILE_H
+#define STAGE3_TILE_H 32
+#endif
+#ifndef STAGE3_TILE_LOCAL_MAX_RESTARTS
+#define STAGE3_TILE_LOCAL_MAX_RESTARTS 64
+#endif
+#ifndef STAGE3_TILE_RELAX_MAX_ITERS
+#define STAGE3_TILE_RELAX_MAX_ITERS 4096
+#endif
+
+#ifndef STAGE3_STITCH_MIN_SUPPORT
+/* Minimum same-k boundary votes required before accepting a tile-to-tile height edge. */
+#define STAGE3_STITCH_MIN_SUPPORT 4
+#endif
+#ifndef STAGE3_STITCH_REQUIRE_MAJORITY
+/* 1 = require chosen k to explain at least half of all valid boundary samples. */
+#define STAGE3_STITCH_REQUIRE_MAJORITY 1
 #endif
 
 __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
@@ -301,22 +311,25 @@ static inline int div_up_int(int a, int b)
 /*  whole image and nothing bad would happen, but the early return matches   */
 /*  the residue-valid region exactly and skips a pointless bitflags read.    */
 
-__global__ void k_pack_residues(const unsigned char *bitflags,
-                                int *pos_residues, int *neg_residues,
-                                int xsize, int ysize)
+__global__ void k_pack_residues_and_mark_cuts(unsigned char *bitflags,
+                                             int *pos_residues, int *neg_residues,
+                                             int xsize, int ysize)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= xsize - 1 || j >= ysize - 1)
         return;
 
-    const unsigned char b = bitflags[j * xsize + i];
+    const int idx_img = j * xsize + i;
+    const unsigned char b = bitflags[idx_img];
     const int enc = encode_ij(i, j);
 
     if (b & kPosRes) {
+        bitflags[idx_img] = (unsigned char)(b | kBranchCut);
         const int idx = atomicAdd(&pos_residues[0], 1);
         pos_residues[1 + idx] = enc;
     } else if (b & kNegRes) {
+        bitflags[idx_img] = (unsigned char)(b | kBranchCut);
         const int idx = atomicAdd(&neg_residues[0], 1);
         neg_residues[1 + idx] = enc;
     }
@@ -586,17 +599,7 @@ __global__ void k_rasterize_cuts(const int *__restrict__ d_pairs,
  *   [5] branch-cut pixels touching image border
  */
 
-/* ------------------------------------------------------------------------- */
-/*  Kernel: force every residue pixel to be part of the branch-cut mask       */
-/* ------------------------------------------------------------------------- */
-__global__ void k_mark_residues_as_branch_cuts(unsigned char *__restrict__ bitflags,
-                                               int length)
-{
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= length) return;
-    if (bitflags[k] & (kPosRes | kNegRes))
-        bitflags[k] |= kBranchCut;
-}
+/* Residue endpoint marking is fused into k_pack_residues_and_mark_cuts. */
 
 __global__ void k_verify_stage2_branchcuts(const unsigned char *__restrict__ bitflags,
                                            int length, int xsize, int ysize,
@@ -684,71 +687,376 @@ static void verify_stage2_branchcuts_device(const UnwrapCudaDeviceBufs *dev,
 }
 
 
-__global__ void k_bfs_expand(const float        *phase,
-                              unsigned char      *bitflags,
-                              float              *soln,
-                              const float        *gradx,
-                              const float        *grady,
-                              const int          *d_in,
-                              int                 n_in,
-                              int                *d_out,
-                              int                *n_out,
-                              int                 xsize,
-                              int                 ysize)
+/* -----------------------------------------------------------------------
+ * Stage 3 tile-independent local unwrap + robust height stitching.
+ *
+ * Each CUDA block owns one spatial tile.  Inside the tile, one worker performs
+ * repeated four-direction sweeps.  This avoids global pixel propagation and
+ * exposes tile-level parallelism.  A second phase stitches tiles by propagating
+ * one additive offset per tile through valid tile-boundary contacts.
+ *
+ * This is not CPU-order exact.  It is intended as the fast tile-independent path:
+ *   local tiled four-direction unwrap -> robust tile-offset propagation -> apply.
+ * ----------------------------------------------------------------------- */
+
+
+__global__ void k_compute_unwrap_gradients(const float *phase,
+                                           float *gradx,
+                                           float *grady,
+                                           int xsize,
+                                           int ysize)
 {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n_in) return;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= xsize || y >= ysize) return;
 
-    const int kk  = d_in[t];
-    const int x   = kk % xsize;
-    const int y   = kk / xsize;
-    const float val = soln[kk];
+    const int k = y * xsize + x;
+    gradx[k] = (x + 1 < xsize) ? device_gradient(phase[k], phase[k + 1]) : 0.0f;
+    grady[k] = (y + 1 < ysize) ? device_gradient(phase[k], phase[k + xsize]) : 0.0f;
+}
 
-    /* left */
-    if (x - 1 >= 0) {
-        const int nb = kk - 1;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val + gradx[nb];
-                d_out[atomicAdd(n_out, 1)] = nb;
+__global__ void k_tile_local_fourdir_floodfill(const float *phase,
+                                               unsigned char *bitflags,
+                                               float *soln,
+                                               const float *gradx,
+                                               const float *grady,
+                                               int xsize,
+                                               int ysize)
+{
+    const int tile_x = blockIdx.x;
+    const int tile_y = blockIdx.y;
+    const int x0 = tile_x * STAGE3_TILE_W;
+    const int y0 = tile_y * STAGE3_TILE_H;
+    const int x1 = min(x0 + STAGE3_TILE_W, xsize);
+    const int y1 = min(y0 + STAGE3_TILE_H, ysize);
+
+    /* One lane per tile. This is deliberately simple/correctness-oriented;
+       parallelism comes from running many tiles concurrently. */
+    if (threadIdx.x != 0) return;
+
+    int restarts = 0;
+    while (restarts < STAGE3_TILE_LOCAL_MAX_RESTARTS) {
+        int seed = -1;
+        for (int y = y0; y < y1 && seed < 0; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                const int k = y * xsize + x;
+                if (!(bitflags[k] & (kAvoid | kUnwrapped))) {
+                    seed = k;
+                    break;
+                }
+            }
+        }
+        if (seed < 0) break;
+
+        bitflags[seed] |= kUnwrapped;
+        soln[seed] = phase[seed];
+
+        bool changed = true;
+        int iter = 0;
+        const int max_iter = (STAGE3_TILE_W + STAGE3_TILE_H) * 4;
+        while (changed && iter < max_iter) {
+            changed = false;
+
+            /* left -> right */
+            for (int y = y0; y < y1; ++y) {
+                for (int x = x0 + 1; x < x1; ++x) {
+                    const int k = y * xsize + x;
+                    const int l = k - 1;
+                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[l] & kUnwrapped)
+                        && !(bitflags[l] & kAvoid)) {
+                        soln[k] = soln[l] - gradx[l];
+                        bitflags[k] |= kUnwrapped;
+                        changed = true;
+                    }
+                }
+            }
+
+            /* right -> left */
+            for (int y = y0; y < y1; ++y) {
+                for (int x = x1 - 2; x >= x0; --x) {
+                    const int k = y * xsize + x;
+                    const int r = k + 1;
+                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[r] & kUnwrapped)
+                        && !(bitflags[r] & kAvoid)) {
+                        soln[k] = soln[r] + gradx[k];
+                        bitflags[k] |= kUnwrapped;
+                        changed = true;
+                    }
+                }
+            }
+
+            /* top -> bottom */
+            for (int y = y0 + 1; y < y1; ++y) {
+                for (int x = x0; x < x1; ++x) {
+                    const int k = y * xsize + x;
+                    const int u = k - xsize;
+                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[u] & kUnwrapped)
+                        && !(bitflags[u] & kAvoid)) {
+                        soln[k] = soln[u] - grady[u];
+                        bitflags[k] |= kUnwrapped;
+                        changed = true;
+                    }
+                }
+            }
+
+            /* bottom -> top */
+            for (int y = y1 - 2; y >= y0; --y) {
+                for (int x = x0; x < x1; ++x) {
+                    const int k = y * xsize + x;
+                    const int d = k + xsize;
+                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[d] & kUnwrapped)
+                        && !(bitflags[d] & kAvoid)) {
+                        soln[k] = soln[d] + grady[k];
+                        bitflags[k] |= kUnwrapped;
+                        changed = true;
+                    }
+                }
+            }
+            ++iter;
+        }
+        ++restarts;
+    }
+}
+
+
+/* -----------------------------------------------------------------------
+ * Robust tile-height matching helpers.
+ *
+ * Each accepted edge stores one relative integer 2*pi relation:
+ *
+ *   offset[neighbor] - offset[current] = edge_k * 2*pi
+ *
+ * The boundary relation is estimated from all valid same-boundary samples,
+ * not from the first valid pair.  This avoids most one-pixel seam errors.
+ * ----------------------------------------------------------------------- */
+
+__device__ __forceinline__ bool tile_stitch_valid(const unsigned char *bitflags, int idx)
+{
+    return !(bitflags[idx] & kAvoid) && (bitflags[idx] & kUnwrapped);
+}
+
+__device__ __forceinline__ void majority_vote_add(int k, int &candidate, int &balance)
+{
+    if (balance == 0) {
+        candidate = k;
+        balance = 1;
+    } else if (k == candidate) {
+        ++balance;
+    } else {
+        --balance;
+    }
+}
+
+/* Returns offset[right_tile] - offset[left_tile] in integer multiples of 2*pi. */
+__device__ __forceinline__ bool robust_boundary_right_delta_k(
+    const unsigned char *bitflags,
+    const float *soln,
+    const float *gradx,
+    int xsize,
+    int ysize,
+    int tx,
+    int ty,
+    int *delta_k_out)
+{
+    const int ax = min((tx + 1) * STAGE3_TILE_W, xsize) - 1;
+    const int bx = ax + 1;
+    if (ax < 0 || bx >= xsize) return false;
+
+    const int y0 = ty * STAGE3_TILE_H;
+    const int y1 = min(y0 + STAGE3_TILE_H, ysize);
+    const float inv_twopi = 1.0f / (float)TWOPI;
+
+    int candidate = 0;
+    int balance = 0;
+    int total = 0;
+
+    for (int y = y0; y < y1; ++y) {
+        const int a = y * xsize + ax;  /* left tile boundary pixel */
+        const int b = y * xsize + bx;  /* right tile boundary pixel */
+        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
+
+        /* soln[b] + offB should equal soln[a] + offA - gradx[a].
+           Therefore offB - offA = soln[a] - gradx[a] - soln[b]. */
+        const float raw = (soln[a] - gradx[a]) - soln[b];
+        const int k = __float2int_rn(raw * inv_twopi);
+        majority_vote_add(k, candidate, balance);
+        ++total;
+    }
+
+    if (total <= 0) return false;
+
+    int support = 0;
+    for (int y = y0; y < y1; ++y) {
+        const int a = y * xsize + ax;
+        const int b = y * xsize + bx;
+        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
+
+        const float raw = (soln[a] - gradx[a]) - soln[b];
+        const int k = __float2int_rn(raw * inv_twopi);
+        if (k == candidate) ++support;
+    }
+
+    if (support < STAGE3_STITCH_MIN_SUPPORT) return false;
+#if STAGE3_STITCH_REQUIRE_MAJORITY
+    if (support * 2 < total) return false;
+#endif
+
+    *delta_k_out = candidate;
+    return true;
+}
+
+/* Returns offset[bottom_tile] - offset[top_tile] in integer multiples of 2*pi. */
+__device__ __forceinline__ bool robust_boundary_down_delta_k(
+    const unsigned char *bitflags,
+    const float *soln,
+    const float *grady,
+    int xsize,
+    int ysize,
+    int tx,
+    int ty,
+    int *delta_k_out)
+{
+    const int ay = min((ty + 1) * STAGE3_TILE_H, ysize) - 1;
+    const int by = ay + 1;
+    if (ay < 0 || by >= ysize) return false;
+
+    const int x0 = tx * STAGE3_TILE_W;
+    const int x1 = min(x0 + STAGE3_TILE_W, xsize);
+    const float inv_twopi = 1.0f / (float)TWOPI;
+
+    int candidate = 0;
+    int balance = 0;
+    int total = 0;
+
+    for (int x = x0; x < x1; ++x) {
+        const int a = ay * xsize + x;  /* top tile boundary pixel */
+        const int b = by * xsize + x;  /* bottom tile boundary pixel */
+        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
+
+        /* soln[b] + offB should equal soln[a] + offA - grady[a].
+           Therefore offB - offA = soln[a] - grady[a] - soln[b]. */
+        const float raw = (soln[a] - grady[a]) - soln[b];
+        const int k = __float2int_rn(raw * inv_twopi);
+        majority_vote_add(k, candidate, balance);
+        ++total;
+    }
+
+    if (total <= 0) return false;
+
+    int support = 0;
+    for (int x = x0; x < x1; ++x) {
+        const int a = ay * xsize + x;
+        const int b = by * xsize + x;
+        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
+
+        const float raw = (soln[a] - grady[a]) - soln[b];
+        const int k = __float2int_rn(raw * inv_twopi);
+        if (k == candidate) ++support;
+    }
+
+    if (support < STAGE3_STITCH_MIN_SUPPORT) return false;
+#if STAGE3_STITCH_REQUIRE_MAJORITY
+    if (support * 2 < total) return false;
+#endif
+
+    *delta_k_out = candidate;
+    return true;
+}
+
+__global__ void k_clear_unwrapped_flags(unsigned char *bitflags, int length)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= length) return;
+    bitflags[k] &= (unsigned char)(~kUnwrapped);
+}
+
+/* edge index layout:
+ *   e = 2 * tile_id + 0: right edge, tile -> tile+1
+ *   e = 2 * tile_id + 1: down edge,  tile -> tile+tiles_x
+ */
+__global__ void k_build_tile_edge_constraints(const unsigned char *bitflags,
+                                              const float *soln,
+                                              const float *gradx,
+                                              const float *grady,
+                                              int *tile_has_valid,
+                                              int *edge_valid,
+                                              int *edge_delta_k,
+                                              int tiles_x,
+                                              int tiles_y,
+                                              int xsize,
+                                              int ysize)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ntiles = tiles_x * tiles_y;
+    if (tid >= ntiles) return;
+
+    const int tx = tid % tiles_x;
+    const int ty = tid / tiles_x;
+    const int e_right = 2 * tid;
+    const int e_down  = 2 * tid + 1;
+
+    edge_valid[e_right] = 0;
+    edge_valid[e_down]  = 0;
+    edge_delta_k[e_right] = 0;
+    edge_delta_k[e_down]  = 0;
+
+    int has_valid = 0;
+    const int x0 = tx * STAGE3_TILE_W;
+    const int y0 = ty * STAGE3_TILE_H;
+    const int x1 = min(x0 + STAGE3_TILE_W, xsize);
+    const int y1 = min(y0 + STAGE3_TILE_H, ysize);
+
+    for (int y = y0; y < y1 && !has_valid; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            const int k = y * xsize + x;
+            if (tile_stitch_valid(bitflags, k)) {
+                has_valid = 1;
+                break;
             }
         }
     }
-    /* right */
-    if (x + 1 < xsize) {
-        const int nb = kk + 1;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val - gradx[kk];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
+    tile_has_valid[tid] = has_valid;
+
+    int dk = 0;
+    if (tx + 1 < tiles_x &&
+        robust_boundary_right_delta_k(bitflags, soln, gradx, xsize, ysize, tx, ty, &dk)) {
+        edge_valid[e_right] = 1;
+        edge_delta_k[e_right] = dk;
     }
-    /* up */
-    if (y - 1 >= 0) {
-        const int nb = kk - xsize;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val + grady[nb];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
+
+    if (ty + 1 < tiles_y &&
+        robust_boundary_down_delta_k(bitflags, soln, grady, xsize, ysize, tx, ty, &dk)) {
+        edge_valid[e_down] = 1;
+        edge_delta_k[e_down] = dk;
     }
-    /* down */
-    if (y + 1 < ysize) {
-        const int nb = kk + xsize;
-        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
-            if (claim_pixel(bitflags, nb)) {
-                soln[nb] = val - grady[kk];
-                d_out[atomicAdd(n_out, 1)] = nb;
-            }
-        }
-    }
+}
+
+__global__ void k_apply_tile_offsets_k(float *soln,
+                                       const unsigned char *bitflags,
+                                       const int *tile_known,
+                                       const int *tile_offset_k,
+                                       int tiles_x,
+                                       int xsize,
+                                       int ysize)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= xsize || y >= ysize) return;
+
+    const int k = y * xsize + x;
+    if (bitflags[k] & kAvoid) return;
+
+    const int tx = x / STAGE3_TILE_W;
+    const int ty = y / STAGE3_TILE_H;
+    const int tid = ty * tiles_x + tx;
+
+    if (tile_known[tid])
+        soln[k] += (float)tile_offset_k[tid] * (float)TWOPI;
 }
 
 /* -----------------------------------------------------------------------
  * Stage 3 kernel 3: AVOID-band fill (branch cuts + border pixels)
- * Same logic as the CPU serial AVOID pass — run once after BFS converges.
+ * Same logic as the CPU serial AVOID pass — run once after tile stitching.
  * One thread per pixel; only acts on pixels with kAvoid set.
  * ----------------------------------------------------------------------- */
 __global__ void k_avoid_fill(const float   *phase,
@@ -840,18 +1148,7 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
 
     e = cudaMalloc((void **)&out->d_grady, (size_t)length * sizeof(float));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_a, (size_t)length * sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_b, (size_t)length * sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_count_a, sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
-
-    e = cudaMalloc((void **)&out->d_frontier_count_b, sizeof(int));
-    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+    /* Stage 3 tile-independent path does not allocate old pixel-propagation buffers. */
 
     return 0;
 }
@@ -869,10 +1166,6 @@ extern "C" void unwrap_cuda_device_bufs_free(UnwrapCudaDeviceBufs *buf)
     cudaFree(buf->d_pairs);
     cudaFree(buf->d_gradx);
     cudaFree(buf->d_grady);
-    cudaFree(buf->d_frontier_a);
-    cudaFree(buf->d_frontier_b);
-    cudaFree(buf->d_frontier_count_a);
-    cudaFree(buf->d_frontier_count_b);
     memset(buf, 0, sizeof(*buf));
 }
 
@@ -985,22 +1278,22 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     cudaEventSynchronize(t1);
     print_cuda_interval("Stage2 reset residue counters", t0, t1);
 
-    /* ---- Kernel 1: pack residues ----------------------------------------- */
+    /* ---- Kernel 1: pack residues and mark residue endpoints as cuts ------- */
     {
         dim3 block(16, 16);
         dim3 grid = residue_grid(xsize, ysize);
 
         cudaEventRecord(t0, 0);
-        k_pack_residues<<<grid, block>>>(dev->d_bitflags,
-                                         dev->d_pos_residues,
-                                         dev->d_neg_residues,
-                                         xsize, ysize);
+        k_pack_residues_and_mark_cuts<<<grid, block>>>(dev->d_bitflags,
+                                                       dev->d_pos_residues,
+                                                       dev->d_neg_residues,
+                                                       xsize, ysize);
         cudaEventRecord(t1, 0);
         cudaEventSynchronize(t1);
-        print_cuda_interval("Stage2 k_pack_residues", t0, t1);
+        print_cuda_interval("Stage2 k_pack_residues+mark_cuts", t0, t1);
 
         if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_pack_residues");
+            cuda_fail(e, "k_pack_residues_and_mark_cuts");
             cudaEventDestroy(t0); cudaEventDestroy(t1);
             return;
         }
@@ -1191,23 +1484,7 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
         }
     }
 
-    /* Safety/correctness fix: Goldstein cuts must include residue endpoints. */
-    {
-        const int threads = STAGE2_GROW_THREADS;
-        const int blocks  = (length + threads - 1) / threads;
-
-        cudaEventRecord(t0, 0);
-        k_mark_residues_as_branch_cuts<<<blocks, threads>>>(dev->d_bitflags, length);
-        cudaEventRecord(t1, 0);
-        cudaEventSynchronize(t1);
-        print_cuda_interval("Stage2 k_mark_residues_as_cuts", t0, t1);
-
-        if ((e = cudaGetLastError()) != cudaSuccess) {
-            cuda_fail(e, "k_mark_residues_as_branch_cuts");
-            cudaEventDestroy(t0); cudaEventDestroy(t1);
-            return;
-        }
-    }
+    /* Residue endpoint marking is already fused into k_pack_residues_and_mark_cuts. */
 
     /* ---- Stage 2 diagnostics: verify that residues are covered by cuts. -- */
     cudaEventRecord(t0, 0);
@@ -1230,315 +1507,323 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     cudaEventDestroy(t1);
 }
 extern "C" void unwrap_cuda_launch_unwrapping(
-    float *h_phase, unsigned char *h_bitflags, float *h_soln,
-    float *h_gradx, float *h_grady,
+    float *h_phase,
+    unsigned char *h_bitflags,
+    float *h_soln,
+    float *h_gradx,
+    float *h_grady,
     const UnwrapCudaDeviceBufs *dev,
-    int xsize, int ysize, int length)
+    int xsize,
+    int ysize,
+    int length)
 {
-    if (length < 1 || !h_phase || !h_bitflags || !h_soln || !h_gradx || !h_grady
-        || xsize < 1 || ysize < 1 || length != xsize * ysize)
-        return;
+    (void)h_gradx;
+    (void)h_grady;
 
-#if STAGE3_FAST_GPU_BFS
-    if (!dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
-        || !dev->d_gradx || !dev->d_grady
-        || !dev->d_frontier_a || !dev->d_frontier_b
-        || !dev->d_frontier_count_a || !dev->d_frontier_count_b) {
-        fprintf(stderr, "unwrap_cuda: Stage3 fast GPU BFS missing device buffers; falling back to CPU exact\n");
-    } else {
-        cudaError_t e;
-        constexpr unsigned char kAvoidU = kBranchCut | kBorder;
-        cudaEvent_t s3_t0, s3_t1;
-        cudaEventCreate(&s3_t0);
-        cudaEventCreate(&s3_t1);
-        clock_t seed_cpu_t0 = clock();
-
-        printf("  [GPU][Stage3 timing] begin\n");
-
-        /* CPU seed selection: one seed per connected component.  This is cheap
-           compared with full CPU unwrapping and avoids the old single-source
-           failure when cuts split the image. */
-        int h_frontier_count = 0;
-        int *h_frontier_tmp = (int*)malloc((size_t)length * sizeof(int));
-        int *stack = (int*)malloc((size_t)length * sizeof(int));
-        if (!h_frontier_tmp || !stack) {
-            fprintf(stderr, "unwrap_cuda: Stage3 seed malloc failed; falling back to CPU exact\n");
-            free(h_frontier_tmp);
-            free(stack);
-        } else {
-            for (int k = 0; k < length; k++)
-                h_bitflags[k] &= ~kUnwrapped;
-
-            for (int k = 0; k < length; k++) {
-                if (!(h_bitflags[k] & (kAvoidU | kUnwrapped))) {
-                    h_soln[k] = h_phase[k];
-                    h_bitflags[k] |= kUnwrapped;
-                    h_frontier_tmp[h_frontier_count++] = k;
-
-                    int top = 0;
-                    stack[top++] = k;
-                    while (top > 0) {
-                        const int cur = stack[--top];
-                        const int cx = cur % xsize;
-                        const int cy = cur / xsize;
-                        int nb;
-                        if (cx > 0) {
-                            nb = cur - 1;
-                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
-                                h_bitflags[nb] |= kUnwrapped;
-                                stack[top++] = nb;
-                            }
-                        }
-                        if (cx + 1 < xsize) {
-                            nb = cur + 1;
-                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
-                                h_bitflags[nb] |= kUnwrapped;
-                                stack[top++] = nb;
-                            }
-                        }
-                        if (cy > 0) {
-                            nb = cur - xsize;
-                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
-                                h_bitflags[nb] |= kUnwrapped;
-                                stack[top++] = nb;
-                            }
-                        }
-                        if (cy + 1 < ysize) {
-                            nb = cur + xsize;
-                            if (!(h_bitflags[nb] & (kAvoidU | kUnwrapped))) {
-                                h_bitflags[nb] |= kUnwrapped;
-                                stack[top++] = nb;
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* Reset all temporary component marks, then mark only seeds. */
-            for (int k = 0; k < length; k++)
-                h_bitflags[k] &= ~kUnwrapped;
-            for (int i = 0; i < h_frontier_count; i++)
-                h_bitflags[h_frontier_tmp[i]] |= kUnwrapped;
-
-            {
-                double seed_ms = 1000.0 * (double)(clock() - seed_cpu_t0) / (double)CLOCKS_PER_SEC;
-                printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 CPU component seed scan", seed_ms);
-            }
-
-            cudaEventRecord(s3_t0, 0);
-            if ((e = cudaMemcpy(dev->d_phase, h_phase,
-                                (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D phase");
-            } else if ((e = cudaMemcpy(dev->d_bitflags, h_bitflags,
-                                       (size_t)length * sizeof(unsigned char), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D bitflags");
-            } else if ((e = cudaMemcpy(dev->d_soln, h_soln,
-                                       (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D soln");
-            } else if ((e = cudaMemcpy(dev->d_gradx, h_gradx,
-                                       (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D gradx");
-            } else if ((e = cudaMemcpy(dev->d_grady, h_grady,
-                                       (size_t)length * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D grady");
-            } else if ((e = cudaMemcpy(dev->d_frontier_a, h_frontier_tmp,
-                                       (size_t)h_frontier_count * sizeof(int), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D seeds");
-            } else if ((e = cudaMemcpy(dev->d_frontier_count_a, &h_frontier_count,
-                                       sizeof(int), cudaMemcpyHostToDevice)) != cudaSuccess) {
-                cuda_fail(e, "Stage3 H2D seed count");
-            } else {
-                cudaEventRecord(s3_t1, 0);
-                cudaEventSynchronize(s3_t1);
-                print_cuda_interval("Stage3 H2D inputs + seeds", s3_t0, s3_t1);
-
-                cudaEventRecord(s3_t0, 0);
-                cudaMemset(dev->d_frontier_count_b, 0, sizeof(int));
-
-                int *d_in = dev->d_frontier_a;
-                int *d_out = dev->d_frontier_b;
-                int *n_in = dev->d_frontier_count_a;
-                int *n_out = dev->d_frontier_count_b;
-                int h_n_in = h_frontier_count;
-                int round = 0;
-
-                while (h_n_in > 0 && round < STAGE3_MAX_BFS_ROUNDS) {
-                    cudaMemset(n_out, 0, sizeof(int));
-                    const int threads = STAGE3_BFS_THREADS;
-                    const int blocks = (h_n_in + threads - 1) / threads;
-                    k_bfs_expand<<<blocks, threads>>>(
-                        dev->d_phase, dev->d_bitflags, dev->d_soln,
-                        dev->d_gradx, dev->d_grady,
-                        d_in, h_n_in, d_out, n_out,
-                        xsize, ysize);
-                    if ((e = cudaGetLastError()) != cudaSuccess) {
-                        cuda_fail(e, "k_bfs_expand");
-                        break;
-                    }
-                    if ((e = cudaDeviceSynchronize()) != cudaSuccess) {
-                        cuda_fail(e, "sync k_bfs_expand");
-                        break;
-                    }
-                    int *tmp;
-                    tmp = d_in; d_in = d_out; d_out = tmp;
-                    tmp = n_in; n_in = n_out; n_out = tmp;
-                    cudaMemcpy(&h_n_in, n_in, sizeof(int), cudaMemcpyDeviceToHost);
-                    ++round;
-                }
-
-                cudaEventRecord(s3_t1, 0);
-                cudaEventSynchronize(s3_t1);
-                print_cuda_interval("Stage3 BFS expand loop total", s3_t0, s3_t1);
-
-                if (h_n_in > 0) {
-                    fprintf(stderr,
-                            "unwrap_cuda: Stage3 BFS stopped after STAGE3_MAX_BFS_ROUNDS=%d "
-                            "with frontier=%d still active; output may be incomplete.\n",
-                            STAGE3_MAX_BFS_ROUNDS, h_n_in);
-                }
-
-                dim3 block(STAGE3_AVOID_TILE_W, STAGE3_AVOID_TILE_H);
-                dim3 grid((xsize + STAGE3_AVOID_TILE_W - 1) / STAGE3_AVOID_TILE_W,
-                          (ysize + STAGE3_AVOID_TILE_H - 1) / STAGE3_AVOID_TILE_H);
-                cudaEventRecord(s3_t0, 0);
-                k_avoid_fill<<<grid, block>>>(dev->d_phase, dev->d_bitflags, dev->d_soln,
-                                              xsize, ysize);
-                if ((e = cudaGetLastError()) != cudaSuccess)
-                    cuda_fail(e, "k_avoid_fill");
-                cudaDeviceSynchronize();
-                cudaEventRecord(s3_t1, 0);
-                cudaEventSynchronize(s3_t1);
-                print_cuda_interval("Stage3 k_avoid_fill", s3_t0, s3_t1);
-
-                cudaEventRecord(s3_t0, 0);
-                cudaMemcpy(h_soln, dev->d_soln,
-                           (size_t)length * sizeof(float), cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_bitflags, dev->d_bitflags,
-                           (size_t)length * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-                cudaEventRecord(s3_t1, 0);
-                cudaEventSynchronize(s3_t1);
-                print_cuda_interval("Stage3 D2H soln + bitflags", s3_t0, s3_t1);
-
-                printf("  [GPU] Stage3 fast BFS: seeds=%d, rounds=%d, max_rounds=%d\n",
-                       h_frontier_count, round, STAGE3_MAX_BFS_ROUNDS);
-                cudaEventDestroy(s3_t0);
-                cudaEventDestroy(s3_t1);
-                free(h_frontier_tmp);
-                free(stack);
-                return;
-            }
-            cudaEventDestroy(s3_t0);
-            cudaEventDestroy(s3_t1);
-            free(h_frontier_tmp);
-            free(stack);
-        }
-    }
-#endif
-
-    /* Exact CPU fallback.  Compile with -DSTAGE3_FAST_GPU_BFS=0 to force this
-       path when exact CPU-order replay is needed for debugging. */
-    printf("  [GPU][Stage3 timing] begin (exact CPU-order fallback)\n");
-    clock_t s3_exact_total_t0 = clock();
-    clock_t s3_exact_t0 = clock();
-
-    int *list = (int*)malloc((size_t)2 * (size_t)(xsize + ysize) * sizeof(int));
-    if (!list) {
-        fprintf(stderr, "unwrap_cuda: Stage3 host frontier malloc failed\n");
+    if (!h_phase || !h_bitflags || !h_soln
+        || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
+        || !dev->d_gradx || !dev->d_grady || xsize <= 0 || ysize <= 0
+        || length != xsize * ysize) {
+        fprintf(stderr, "unwrap_cuda: invalid Stage3 arguments\n");
         return;
     }
 
-    int num_pieces = 0;
-    int max_frontier = 0;
+    printf("  [GPU][Stage3 timing] begin (tile-independent unwrap + tile-graph height stitching)\n");
+    fflush(stdout);
 
-    for (int k = 0; k < length; k++) {
-        if (!(h_bitflags[k] & (kBranchCut | kBorder | kUnwrapped))) {
-            ++num_pieces;
-            h_soln[k] = h_phase[k];
+    cudaError_t e = cudaSuccess;
+    cudaEvent_t t0 = nullptr, t1 = nullptr, total0 = nullptr, total1 = nullptr;
 
-            int flag = 1;
-            int base_in = 0;
-            int base_out = xsize + ysize;
-            int top_in = base_in;
-            int top_out = base_out;
+    const int tiles_x = div_up_int(xsize, STAGE3_TILE_W);
+    const int tiles_y = div_up_int(ysize, STAGE3_TILE_H);
+    const int ntiles = tiles_x * tiles_y;
+    const int edge_count = 2 * ntiles;
+    const int tile_threads = 256;
+    const int tile_blocks = div_up_int(ntiles, tile_threads);
 
-            list[top_in++] = k;
+    int *d_tile_has_valid = nullptr;
+    int *d_edge_valid = nullptr;
+    int *d_edge_delta_k = nullptr;
+    int *d_tile_known = nullptr;
+    int *d_tile_offset_k = nullptr;
 
-            while (flag) {
-                if (top_in - base_in > max_frontier)
-                    max_frontier = top_in - base_in;
+    int *h_tile_has_valid = nullptr;
+    int *h_edge_valid = nullptr;
+    int *h_edge_delta_k = nullptr;
+    int *h_tile_known = nullptr;
+    int *h_tile_offset_k = nullptr;
+    int *h_queue = nullptr;
 
-                for (int l = base_in; l < top_in; l++) {
-                    const int kk = list[l];
-                    const int x = kk % xsize;
-                    const int y = kk / xsize;
+    int valid_edges = 0;
+    int visited_tiles = 0;
+    int components = 0;
+    int conflicts = 0;
+    int max_abs_offset_k = 0;
 
-                    h_bitflags[kk] |= kUnwrapped;
-                    const float value = h_soln[kk];
+    e = cudaEventCreate(&t0);
+    if (cuda_fail(e, "Stage3 create event t0")) goto cleanup;
+    e = cudaEventCreate(&t1);
+    if (cuda_fail(e, "Stage3 create event t1")) goto cleanup;
+    e = cudaEventCreate(&total0);
+    if (cuda_fail(e, "Stage3 create event total0")) goto cleanup;
+    e = cudaEventCreate(&total1);
+    if (cuda_fail(e, "Stage3 create event total1")) goto cleanup;
+    e = cudaEventRecord(total0, 0);
+    if (cuda_fail(e, "Stage3 record total0")) goto cleanup;
 
-                    int index;
-                    index = kk - 1;
-                    if (x - 1 >= 0 && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
-                        h_bitflags[index] |= kUnwrapped;
-                        h_soln[index] = value + h_gradx[index];
-                        list[top_out++] = index;
-                    }
-                    index = kk + 1;
-                    if (x + 1 < xsize && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
-                        h_bitflags[index] |= kUnwrapped;
-                        h_soln[index] = value - h_gradx[kk];
-                        list[top_out++] = index;
-                    }
-                    index = kk - xsize;
-                    if (y - 1 >= 0 && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
-                        h_bitflags[index] |= kUnwrapped;
-                        h_soln[index] = value + h_grady[index];
-                        list[top_out++] = index;
-                    }
-                    index = kk + xsize;
-                    if (y + 1 < ysize && !(h_bitflags[index] & (kBranchCut | kUnwrapped | kBorder))) {
-                        h_bitflags[index] |= kUnwrapped;
-                        h_soln[index] = value - h_grady[kk];
-                        list[top_out++] = index;
+    h_tile_has_valid = (int*)calloc((size_t)ntiles, sizeof(int));
+    h_edge_valid     = (int*)calloc((size_t)edge_count, sizeof(int));
+    h_edge_delta_k   = (int*)calloc((size_t)edge_count, sizeof(int));
+    h_tile_known     = (int*)calloc((size_t)ntiles, sizeof(int));
+    h_tile_offset_k  = (int*)calloc((size_t)ntiles, sizeof(int));
+    h_queue          = (int*)malloc((size_t)ntiles * sizeof(int));
+    if (!h_tile_has_valid || !h_edge_valid || !h_edge_delta_k ||
+        !h_tile_known || !h_tile_offset_k || !h_queue) {
+        fprintf(stderr, "unwrap_cuda: Stage3 host allocation failed\n");
+        goto cleanup;
+    }
+
+    e = cudaMalloc((void **)&d_tile_has_valid, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc tile_has_valid")) goto cleanup;
+    e = cudaMalloc((void **)&d_edge_valid, (size_t)edge_count * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc edge_valid")) goto cleanup;
+    e = cudaMalloc((void **)&d_edge_delta_k, (size_t)edge_count * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc edge_delta_k")) goto cleanup;
+    e = cudaMalloc((void **)&d_tile_known, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc tile_known")) goto cleanup;
+    e = cudaMalloc((void **)&d_tile_offset_k, (size_t)ntiles * sizeof(int));
+    if (cuda_fail(e, "Stage3 malloc tile_offset_k")) goto cleanup;
+
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(dev->d_phase, h_phase, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D phase")) goto cleanup;
+    e = cudaMemcpy(dev->d_bitflags, h_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D bitflags")) goto cleanup;
+    e = cudaMemset(dev->d_soln, 0, (size_t)length * sizeof(float));
+    if (cuda_fail(e, "Stage3 memset soln")) goto cleanup;
+    {
+        const int threads = 256;
+        const int blocks = div_up_int(length, threads);
+        k_clear_unwrapped_flags<<<blocks, threads>>>(dev->d_bitflags, length);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_clear_unwrapped_flags")) goto cleanup;
+    }
+    {
+        dim3 block(16, 16);
+        dim3 grid(div_up_int(xsize, (int)block.x), div_up_int(ysize, (int)block.y));
+        k_compute_unwrap_gradients<<<grid, block>>>(dev->d_phase, dev->d_gradx, dev->d_grady,
+                                                    xsize, ysize);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_compute_unwrap_gradients")) goto cleanup;
+        e = cudaDeviceSynchronize();
+        if (cuda_fail(e, "sync Stage3 H2D/gradients")) goto cleanup;
+    }
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage3 H2D + GPU gradients", t0, t1);
+
+    cudaEventRecord(t0, 0);
+    {
+        dim3 grid(tiles_x, tiles_y);
+        k_tile_local_fourdir_floodfill<<<grid, 1>>>(dev->d_phase, dev->d_bitflags, dev->d_soln,
+                                                    dev->d_gradx, dev->d_grady, xsize, ysize);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_tile_local_fourdir_floodfill")) goto cleanup;
+        e = cudaDeviceSynchronize();
+        if (cuda_fail(e, "sync k_tile_local_fourdir_floodfill")) goto cleanup;
+    }
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage3 tile-local fourdir", t0, t1);
+
+    cudaEventRecord(t0, 0);
+    k_build_tile_edge_constraints<<<tile_blocks, tile_threads>>>(
+        dev->d_bitflags, dev->d_soln, dev->d_gradx, dev->d_grady,
+        d_tile_has_valid, d_edge_valid, d_edge_delta_k,
+        tiles_x, tiles_y, xsize, ysize);
+    e = cudaGetLastError();
+    if (cuda_fail(e, "k_build_tile_edge_constraints")) goto cleanup;
+    e = cudaDeviceSynchronize();
+    if (cuda_fail(e, "sync k_build_tile_edge_constraints")) goto cleanup;
+    e = cudaMemcpy(h_tile_has_valid, d_tile_has_valid,
+                   (size_t)ntiles * sizeof(int), cudaMemcpyDeviceToHost);
+    if (cuda_fail(e, "Stage3 D2H tile_has_valid")) goto cleanup;
+    e = cudaMemcpy(h_edge_valid, d_edge_valid,
+                   (size_t)edge_count * sizeof(int), cudaMemcpyDeviceToHost);
+    if (cuda_fail(e, "Stage3 D2H edge_valid")) goto cleanup;
+    e = cudaMemcpy(h_edge_delta_k, d_edge_delta_k,
+                   (size_t)edge_count * sizeof(int), cudaMemcpyDeviceToHost);
+    if (cuda_fail(e, "Stage3 D2H edge_delta_k")) goto cleanup;
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage3 build+D2H tile edges", t0, t1);
+
+    cudaEventRecord(t0, 0);
+
+    /* CPU solve on the tiny tile graph.  This is not pixel propagation; it only solves
+       one integer 2*pi height per tile. */
+    for (int tid = 0; tid < ntiles; ++tid) {
+        if (!h_edge_valid[2 * tid] && !h_edge_valid[2 * tid + 1])
+            continue;
+        valid_edges += h_edge_valid[2 * tid] + h_edge_valid[2 * tid + 1];
+    }
+
+    for (int root = 0; root < ntiles; ++root) {
+        if (!h_tile_has_valid[root] || h_tile_known[root])
+            continue;
+
+        ++components;
+        h_tile_known[root] = 1;
+        h_tile_offset_k[root] = 0;
+
+        int qh = 0;
+        int qt = 0;
+        h_queue[qt++] = root;
+
+        while (qh < qt) {
+            const int cur = h_queue[qh++];
+            const int tx = cur % tiles_x;
+            const int ty = cur / tiles_x;
+            const int cur_k = h_tile_offset_k[cur];
+
+            int nb, eidx, expected;
+
+            if (tx + 1 < tiles_x) {
+                nb = cur + 1;
+                eidx = 2 * cur;
+                if (h_edge_valid[eidx]) {
+                    expected = cur_k + h_edge_delta_k[eidx];
+                    if (!h_tile_known[nb]) {
+                        h_tile_known[nb] = 1;
+                        h_tile_offset_k[nb] = expected;
+                        h_queue[qt++] = nb;
+                    } else if (h_tile_offset_k[nb] != expected) {
+                        ++conflicts;
                     }
                 }
+            }
 
-                if (base_out == top_out) flag = 0;
-                else {
-                    int tmp;
-                    tmp = base_in;  base_in = base_out;  base_out = tmp;
-                    tmp = top_in;   top_in = top_out;    top_out = tmp;
-                    top_out = base_out;
+            if (tx > 0) {
+                nb = cur - 1;
+                eidx = 2 * nb;
+                if (h_edge_valid[eidx]) {
+                    expected = cur_k - h_edge_delta_k[eidx];
+                    if (!h_tile_known[nb]) {
+                        h_tile_known[nb] = 1;
+                        h_tile_offset_k[nb] = expected;
+                        h_queue[qt++] = nb;
+                    } else if (h_tile_offset_k[nb] != expected) {
+                        ++conflicts;
+                    }
+                }
+            }
+
+            if (ty + 1 < tiles_y) {
+                nb = cur + tiles_x;
+                eidx = 2 * cur + 1;
+                if (h_edge_valid[eidx]) {
+                    expected = cur_k + h_edge_delta_k[eidx];
+                    if (!h_tile_known[nb]) {
+                        h_tile_known[nb] = 1;
+                        h_tile_offset_k[nb] = expected;
+                        h_queue[qt++] = nb;
+                    } else if (h_tile_offset_k[nb] != expected) {
+                        ++conflicts;
+                    }
+                }
+            }
+
+            if (ty > 0) {
+                nb = cur - tiles_x;
+                eidx = 2 * nb + 1;
+                if (h_edge_valid[eidx]) {
+                    expected = cur_k - h_edge_delta_k[eidx];
+                    if (!h_tile_known[nb]) {
+                        h_tile_known[nb] = 1;
+                        h_tile_offset_k[nb] = expected;
+                        h_queue[qt++] = nb;
+                    } else if (h_tile_offset_k[nb] != expected) {
+                        ++conflicts;
+                    }
                 }
             }
         }
     }
 
-    {
-        double ms = 1000.0 * (double)(clock() - s3_exact_t0) / (double)CLOCKS_PER_SEC;
-        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 exact frontier unwrap", ms);
-    }
-    s3_exact_t0 = clock();
-
-    for (int j = 1; j < ysize; j++) {
-        for (int i = 1; i < xsize; i++) {
-            const int k = j * xsize + i;
-            if (h_bitflags[k] & (kBranchCut | kBorder)) {
-                if (!(h_bitflags[k - 1] & (kBranchCut | kBorder)))
-                    h_soln[k] = h_soln[k - 1] + host_gradient(h_phase[k], h_phase[k - 1]);
-                else if (!(h_bitflags[k - xsize] & (kBranchCut | kBorder)))
-                    h_soln[k] = h_soln[k - xsize] + host_gradient(h_phase[k], h_phase[k - xsize]);
-            }
+    for (int tid = 0; tid < ntiles; ++tid) {
+        if (h_tile_known[tid]) {
+            ++visited_tiles;
+            const int a = abs(h_tile_offset_k[tid]);
+            if (a > max_abs_offset_k) max_abs_offset_k = a;
         }
     }
 
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage3 CPU tile graph solve", t0, t1);
+
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(d_tile_known, h_tile_known,
+                   (size_t)ntiles * sizeof(int), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D tile_known")) goto cleanup;
+    e = cudaMemcpy(d_tile_offset_k, h_tile_offset_k,
+                   (size_t)ntiles * sizeof(int), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D tile_offset_k")) goto cleanup;
+
     {
-        double ms = 1000.0 * (double)(clock() - s3_exact_t0) / (double)CLOCKS_PER_SEC;
-        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 exact avoid-fill", ms);
-        double total_ms = 1000.0 * (double)(clock() - s3_exact_total_t0) / (double)CLOCKS_PER_SEC;
-        printf("  [GPU][timing] %-34s %.4f ms\n", "Stage3 exact total", total_ms);
+        dim3 block(STAGE3_AVOID_TILE_W, STAGE3_AVOID_TILE_H);
+        dim3 grid(div_up_int(xsize, STAGE3_AVOID_TILE_W), div_up_int(ysize, STAGE3_AVOID_TILE_H));
+
+        k_apply_tile_offsets_k<<<grid, block>>>(dev->d_soln, dev->d_bitflags,
+                                                d_tile_known, d_tile_offset_k,
+                                                tiles_x, xsize, ysize);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_apply_tile_offsets_k")) goto cleanup;
+
+        k_avoid_fill<<<grid, block>>>(dev->d_phase, dev->d_bitflags, dev->d_soln, xsize, ysize);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_avoid_fill")) goto cleanup;
+        e = cudaDeviceSynchronize();
+        if (cuda_fail(e, "sync apply tile offsets/avoid")) goto cleanup;
     }
 
-    printf("  [GPU] Stage3 exact CPU fallback: pieces=%d, max_frontier=%d\n",
-           num_pieces, max_frontier);
-    free(list);
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage3 apply offsets + avoid", t0, t1);
+
+    cudaEventRecord(t0, 0);
+    e = cudaMemcpy(h_soln, dev->d_soln, (size_t)length * sizeof(float), cudaMemcpyDeviceToHost);
+    if (cuda_fail(e, "Stage3 D2H soln")) goto cleanup;
+    e = cudaMemcpy(h_bitflags, dev->d_bitflags, (size_t)length * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    if (cuda_fail(e, "Stage3 D2H bitflags")) goto cleanup;
+    cudaEventRecord(t1, 0);
+    cudaEventSynchronize(t1);
+    print_cuda_interval("Stage3 D2H outputs", t0, t1);
+
+    cudaEventRecord(total1, 0);
+    cudaEventSynchronize(total1);
+    print_cuda_interval("Stage3 tile total", total0, total1);
+    printf("  [GPU] Stage3 tile-independent+tilegraph-stitch: tile=%dx%d tiles=%dx%d valid_edges=%d visited_tiles=%d/%d components=%d conflicts=%d max_abs_offset_k=%d min_support=%d majority=%d\n",
+           STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y,
+           valid_edges, visited_tiles, ntiles, components, conflicts, max_abs_offset_k,
+           STAGE3_STITCH_MIN_SUPPORT, STAGE3_STITCH_REQUIRE_MAJORITY);
+
+cleanup:
+    cudaFree(d_tile_has_valid);
+    cudaFree(d_edge_valid);
+    cudaFree(d_edge_delta_k);
+    cudaFree(d_tile_known);
+    cudaFree(d_tile_offset_k);
+
+    free(h_tile_has_valid);
+    free(h_edge_valid);
+    free(h_edge_delta_k);
+    free(h_tile_known);
+    free(h_tile_offset_k);
+    free(h_queue);
+
+    if (t0) cudaEventDestroy(t0);
+    if (t1) cudaEventDestroy(t1);
+    if (total0) cudaEventDestroy(total0);
+    if (total1) cudaEventDestroy(total1);
 }
