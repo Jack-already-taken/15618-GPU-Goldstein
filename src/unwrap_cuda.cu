@@ -31,6 +31,7 @@ static void print_cuda_interval(const char *name, cudaEvent_t start, cudaEvent_t
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
     printf("  [GPU][timing] %-34s %.4f ms\n", name, ms);
+    fflush(stdout);
 }
 
 
@@ -141,6 +142,12 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 /* If local bins have no candidate, fall back to the old full scan for that
    residue. Set to 0 for maximum speed, 1 for safer matching. */
 #define STAGE2_BIN_FALLBACK_FULL_SCAN 0
+#endif
+
+#ifndef STAGE3_FAST_GPU_BFS
+/* 0 = exact CPU-order frontier fallback.
+   1 = experimental fast GPU BFS. */
+#define STAGE3_FAST_GPU_BFS 0
 #endif
 
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
@@ -722,6 +729,22 @@ static void verify_stage2_branchcuts_device(const UnwrapCudaDeviceBufs *dev,
  *   local tiled flood fill -> four-neighbor tile-offset propagation -> apply.
  * ----------------------------------------------------------------------- */
 
+
+__global__ void k_compute_unwrap_gradients(const float *phase,
+                                           float *gradx,
+                                           float *grady,
+                                           int xsize,
+                                           int ysize)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= xsize || y >= ysize) return;
+
+    const int k = y * xsize + x;
+    gradx[k] = (x + 1 < xsize) ? device_gradient(phase[k], phase[k + 1]) : 0.0f;
+    grady[k] = (y + 1 < ysize) ? device_gradient(phase[k], phase[k + xsize]) : 0.0f;
+}
+
 __global__ void k_tile_local_fourdir_floodfill(const float *phase,
                                                unsigned char *bitflags,
                                                float *soln,
@@ -1153,6 +1176,8 @@ __global__ void k_apply_tile_offsets(float *soln,
     const int tid = ty * tiles_x + tx;
     if (tile_known[tid]) soln[k] += tile_offsets[tid];
 }
+
+
 
 __global__ void k_bfs_expand(const float        *phase,
                               unsigned char      *bitflags,
@@ -1699,7 +1724,10 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int ysize,
     int length)
 {
-    if (!h_phase || !h_bitflags || !h_soln || !h_gradx || !h_grady
+    (void)h_gradx;
+    (void)h_grady;
+
+    if (!h_phase || !h_bitflags || !h_soln
         || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
         || !dev->d_gradx || !dev->d_grady || xsize <= 0 || ysize <= 0
         || length != xsize * ysize) {
@@ -1711,12 +1739,17 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     fflush(stdout);
 
     cudaError_t e;
-    cudaEvent_t t0, t1, total0, total1;
-    cudaEventCreate(&t0);
-    cudaEventCreate(&t1);
-    cudaEventCreate(&total0);
-    cudaEventCreate(&total1);
-    cudaEventRecord(total0, 0);
+    cudaEvent_t t0 = nullptr, t1 = nullptr, total0 = nullptr, total1 = nullptr;
+    e = cudaEventCreate(&t0);
+    if (cuda_fail(e, "Stage3 create event t0")) goto cleanup;
+    e = cudaEventCreate(&t1);
+    if (cuda_fail(e, "Stage3 create event t1")) goto cleanup;
+    e = cudaEventCreate(&total0);
+    if (cuda_fail(e, "Stage3 create event total0")) goto cleanup;
+    e = cudaEventCreate(&total1);
+    if (cuda_fail(e, "Stage3 create event total1")) goto cleanup;
+    e = cudaEventRecord(total0, 0);
+    if (cuda_fail(e, "Stage3 record total0")) goto cleanup;
 
     const int tiles_x = div_up_int(xsize, STAGE3_TILE_W);
     const int tiles_y = div_up_int(ysize, STAGE3_TILE_H);
@@ -1745,13 +1778,19 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     if (cuda_fail(e, "Stage3 H2D bitflags")) goto cleanup;
     e = cudaMemset(dev->d_soln, 0, (size_t)length * sizeof(float));
     if (cuda_fail(e, "Stage3 memset soln")) goto cleanup;
-    e = cudaMemcpy(dev->d_gradx, h_gradx, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
-    if (cuda_fail(e, "Stage3 H2D gradx")) goto cleanup;
-    e = cudaMemcpy(dev->d_grady, h_grady, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
-    if (cuda_fail(e, "Stage3 H2D grady")) goto cleanup;
+    {
+        dim3 block(16, 16);
+        dim3 grid(div_up_int(xsize, block.x), div_up_int(ysize, block.y));
+        k_compute_unwrap_gradients<<<grid, block>>>(dev->d_phase, dev->d_gradx, dev->d_grady,
+                                                    xsize, ysize);
+        e = cudaGetLastError();
+        if (cuda_fail(e, "k_compute_unwrap_gradients")) goto cleanup;
+        e = cudaDeviceSynchronize();
+        if (cuda_fail(e, "sync k_compute_unwrap_gradients")) goto cleanup;
+    }
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 H2D inputs", t0, t1);
+    print_cuda_interval("Stage3 H2D + GPU gradients", t0, t1);
 
     cudaEventRecord(t0, 0);
     {
@@ -1792,7 +1831,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         if (cuda_fail(e, "k_tile_offset_relax")) goto cleanup;
         e = cudaDeviceSynchronize();
         if (cuda_fail(e, "sync k_tile_offset_relax")) goto cleanup;
-        cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+        e = cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+        if (cuda_fail(e, "Stage3 D2H changed")) goto cleanup;
         ++relax_iter;
     }
     cudaEventRecord(t1, 0);
@@ -1837,8 +1877,8 @@ cleanup:
     cudaFree(d_tile_known);
     cudaFree(d_tile_offsets);
     cudaFree(d_changed);
-    cudaEventDestroy(t0);
-    cudaEventDestroy(t1);
-    cudaEventDestroy(total0);
-    cudaEventDestroy(total1);
+    if (t0) cudaEventDestroy(t0);
+    if (t1) cudaEventDestroy(t1);
+    if (total0) cudaEventDestroy(total0);
+    if (total1) cudaEventDestroy(total1);
 }
