@@ -173,54 +173,82 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #define STAGE3_STITCH_REQUIRE_MAJORITY 1
 #endif
 
-__global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
-                                    int xsize, int ysize, int *d_num_res)
+// __global__ void k_identify_residues(const float *phase, unsigned char *bitflags,
+//                                     int xsize, int ysize, int *d_num_res)
+// {
+//     __shared__ float s[STAGE1_RESIDUE_TILE_H + 1][STAGE1_RESIDUE_TILE_W + 1];
+
+//     const int tx = threadIdx.x;
+//     const int ty = threadIdx.y;
+//     const int i  = blockIdx.x * STAGE1_RESIDUE_TILE_W + tx;
+//     const int j  = blockIdx.y * STAGE1_RESIDUE_TILE_H + ty;
+
+//     /* Load (TILE_H+1) x (TILE_W+1) patch — every thread loads its own cell,
+//        edge threads also load the +1 halo column / row */
+//     if (i < xsize && j < ysize)
+//         s[ty][tx] = phase[j * xsize + i];
+
+//     if (tx == STAGE1_RESIDUE_TILE_W - 1 && i + 1 < xsize && j < ysize)
+//         s[ty][tx + 1] = phase[j * xsize + (i + 1)];
+
+//     if (ty == STAGE1_RESIDUE_TILE_H - 1 && j + 1 < ysize && i < xsize)
+//         s[ty + 1][tx] = phase[(j + 1) * xsize + i];
+
+//     if (tx == STAGE1_RESIDUE_TILE_W - 1 && ty == STAGE1_RESIDUE_TILE_H - 1 && i + 1 < xsize && j + 1 < ysize)
+//         s[ty + 1][tx + 1] = phase[(j + 1) * xsize + (i + 1)];
+
+//     __syncthreads();
+
+//     if (i >= xsize - 1 || j >= ysize - 1)
+//         return;
+
+//     const int k = j * xsize + i;
+//     constexpr unsigned char avoid = kBranchCut | kBorder;
+//     if ((bitflags[k] & avoid) || (bitflags[k + 1] & avoid)
+//         || (bitflags[k + 1 + xsize] & avoid) || (bitflags[k + xsize] & avoid))
+//         return;
+
+//     const float p00 = s[ty    ][tx    ];
+//     const float p10 = s[ty    ][tx + 1];
+//     const float p11 = s[ty + 1][tx + 1];
+//     const float p01 = s[ty + 1][tx    ];
+
+//     const float r = device_gradient(p10, p00)
+//                   + device_gradient(p11, p10)
+//                   + device_gradient(p01, p11)
+//                   + device_gradient(p00, p01);
+
+//     const float thr = static_cast<float>(RESIDUE_THRESHOLD);
+//     if (r > thr)        bitflags[k] |= kPosRes;
+//     else if (r < -thr)  bitflags[k] |= kNegRes;
+//     if (r * r > thr * thr)
+//         atomicAdd(d_num_res, 1);
+// }
+
+__global__ void k_identify_residues(const float *phase, unsigned char *bitflags, int xsize,
+                                    int ysize, int *d_num_res)
 {
-    __shared__ float s[STAGE1_RESIDUE_TILE_H + 1][STAGE1_RESIDUE_TILE_W + 1];
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int i  = blockIdx.x * STAGE1_RESIDUE_TILE_W + tx;
-    const int j  = blockIdx.y * STAGE1_RESIDUE_TILE_H + ty;
-
-    /* Load (TILE_H+1) x (TILE_W+1) patch — every thread loads its own cell,
-       edge threads also load the +1 halo column / row */
-    if (i < xsize && j < ysize)
-        s[ty][tx] = phase[j * xsize + i];
-
-    if (tx == STAGE1_RESIDUE_TILE_W - 1 && i + 1 < xsize && j < ysize)
-        s[ty][tx + 1] = phase[j * xsize + (i + 1)];
-
-    if (ty == STAGE1_RESIDUE_TILE_H - 1 && j + 1 < ysize && i < xsize)
-        s[ty + 1][tx] = phase[(j + 1) * xsize + i];
-
-    if (tx == STAGE1_RESIDUE_TILE_W - 1 && ty == STAGE1_RESIDUE_TILE_H - 1 && i + 1 < xsize && j + 1 < ysize)
-        s[ty + 1][tx + 1] = phase[(j + 1) * xsize + (i + 1)];
-
-    __syncthreads();
-
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= xsize - 1 || j >= ysize - 1)
         return;
 
-    const int k = j * xsize + i;
+    const int                k = j * xsize + i;
     constexpr unsigned char avoid = kBranchCut | kBorder;
     if ((bitflags[k] & avoid) || (bitflags[k + 1] & avoid)
         || (bitflags[k + 1 + xsize] & avoid) || (bitflags[k + xsize] & avoid))
         return;
 
-    const float p00 = s[ty    ][tx    ];
-    const float p10 = s[ty    ][tx + 1];
-    const float p11 = s[ty + 1][tx + 1];
-    const float p01 = s[ty + 1][tx    ];
-
-    const float r = device_gradient(p10, p00)
-                  + device_gradient(p11, p10)
-                  + device_gradient(p01, p11)
-                  + device_gradient(p00, p01);
+    const float r = device_gradient(phase[k + 1], phase[k])
+                    + device_gradient(phase[k + 1 + xsize], phase[k + 1])
+                    + device_gradient(phase[k + xsize], phase[k + 1 + xsize])
+                    + device_gradient(phase[k], phase[k + xsize]);
 
     const float thr = static_cast<float>(RESIDUE_THRESHOLD);
-    if (r > thr)        bitflags[k] |= kPosRes;
-    else if (r < -thr)  bitflags[k] |= kNegRes;
+    if (r > thr)
+        bitflags[k] |= kPosRes;
+    else if (r < -thr)
+        bitflags[k] |= kNegRes;
     if (r * r > thr * thr)
         atomicAdd(d_num_res, 1);
 }
@@ -1192,8 +1220,6 @@ extern "C" int unwrap_cuda_launch_residue_identification(
     if ((e = cudaMemset(dev->d_residue_count, 0, sizeof(int))) != cudaSuccess)
         return cuda_fail(e, "memset count");
 
-    // dim3 block(16, 16);
-    // dim3 grid = residue_grid(xsize, ysize);
 
     dim3 block(STAGE1_RESIDUE_TILE_W, STAGE1_RESIDUE_TILE_H);
     dim3 grid((xsize + STAGE1_RESIDUE_TILE_W - 1) / STAGE1_RESIDUE_TILE_W,
