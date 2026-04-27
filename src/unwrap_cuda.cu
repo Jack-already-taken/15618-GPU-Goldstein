@@ -125,14 +125,13 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #define STAGE2_USE_FIXED_BINS 1
 #endif
 #ifndef STAGE2_BIN_TILE_W
-/* Fixed spatial bin tile size in pixels. A 4096x4096 image uses 64x64 bins. */
 #define STAGE2_BIN_TILE_W 64
 #endif
 #ifndef STAGE2_BIN_TILE_H
 #define STAGE2_BIN_TILE_H 64
 #endif
 #ifndef STAGE2_BIN_CAP
-#define STAGE2_BIN_CAP 32
+#define STAGE2_BIN_CAP 64
 #endif
 #ifndef STAGE2_BIN_SEARCH_RADIUS
 #define STAGE2_BIN_SEARCH_RADIUS 2
@@ -146,7 +145,7 @@ __device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
 #ifndef STAGE3_FAST_GPU_BFS
 /* 0 = exact CPU-order frontier fallback.
    1 = experimental fast GPU BFS. */
-#define STAGE3_FAST_GPU_BFS 0
+#define STAGE3_FAST_GPU_BFS 1
 #endif
 
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
