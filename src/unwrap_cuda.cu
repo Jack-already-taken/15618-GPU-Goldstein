@@ -31,7 +31,6 @@ static void print_cuda_interval(const char *name, cudaEvent_t start, cudaEvent_t
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
     printf("  [GPU][timing] %-34s %.4f ms\n", name, ms);
-    fflush(stdout);
 }
 
 
@@ -43,6 +42,14 @@ __device__ __forceinline__ float device_gradient(float p1, float p2)
     else if (r < -(float)PI)
         r += (float)TWOPI;
     return r;
+}
+
+__device__ __forceinline__ bool claim_pixel(unsigned char *flags, int idx)
+{
+    unsigned int *word = (unsigned int*)(flags + (idx & ~3));
+    unsigned int bit   = (unsigned int)kUnwrapped << ((idx & 3) * 8);
+    unsigned int old   = atomicOr(word, bit);
+    return !(old & bit);
 }
 
 // __global__ void k_identify_residues(const float *phase, unsigned char *bitflags, int xsize,
@@ -79,8 +86,8 @@ __device__ __forceinline__ float device_gradient(float p1, float p2)
  *
  * Stage 1 uses a 2D tile and shared-memory halo for residue detection.
  * Stage 2 uses 1D thread blocks for residue packing and cluster growth.
- * Stage 3 uses tile-independent local unwrap, tile-height stitching,
- * and a 2D tile for the final AVOID-band fill pass.
+ * Stage 3 uses 1D thread blocks for BFS expansion and a 2D tile for the
+ * final AVOID-band fill pass.
  * ----------------------------------------------------------------------- */
 #ifndef STAGE1_RESIDUE_TILE_W
 #define STAGE1_RESIDUE_TILE_W 16
@@ -125,7 +132,7 @@ __device__ __forceinline__ float device_gradient(float p1, float p2)
 #define STAGE2_BIN_TILE_H 64
 #endif
 #ifndef STAGE2_BIN_CAP
-#define STAGE2_BIN_CAP 32
+#define STAGE2_BIN_CAP 128
 #endif
 #ifndef STAGE2_BIN_SEARCH_RADIUS
 #define STAGE2_BIN_SEARCH_RADIUS 2
@@ -136,8 +143,20 @@ __device__ __forceinline__ float device_gradient(float p1, float p2)
 #define STAGE2_BIN_FALLBACK_FULL_SCAN 0
 #endif
 
+#ifndef STAGE3_FAST_GPU_BFS
+/* 0 = exact CPU-order frontier fallback.
+   1 = experimental fast GPU BFS. */
+#define STAGE3_FAST_GPU_BFS 0
+#endif
+
 constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 
+#ifndef STAGE3_BFS_THREADS
+#define STAGE3_BFS_THREADS 256
+#endif
+#ifndef STAGE3_MAX_BFS_ROUNDS
+#define STAGE3_MAX_BFS_ROUNDS 20000
+#endif
 #ifndef STAGE3_AVOID_TILE_W
 #define STAGE3_AVOID_TILE_W 16
 #endif
@@ -157,16 +176,6 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #endif
 #ifndef STAGE3_TILE_RELAX_MAX_ITERS
 #define STAGE3_TILE_RELAX_MAX_ITERS 4096
-#endif
-
-
-#ifndef STAGE3_STITCH_MIN_SUPPORT
-/* Minimum same-k boundary votes required before accepting a tile-to-tile height edge. */
-#define STAGE3_STITCH_MIN_SUPPORT 4
-#endif
-#ifndef STAGE3_STITCH_REQUIRE_MAJORITY
-/* 1 = require chosen k to explain at least half of all valid boundary samples. */
-#define STAGE3_STITCH_REQUIRE_MAJORITY 1
 #endif
 
 
@@ -709,22 +718,6 @@ static void verify_stage2_branchcuts_device(const UnwrapCudaDeviceBufs *dev,
  *   local tiled flood fill -> four-neighbor tile-offset propagation -> apply.
  * ----------------------------------------------------------------------- */
 
-
-__global__ void k_compute_unwrap_gradients(const float *phase,
-                                           float *gradx,
-                                           float *grady,
-                                           int xsize,
-                                           int ysize)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= xsize || y >= ysize) return;
-
-    const int k = y * xsize + x;
-    gradx[k] = (x + 1 < xsize) ? device_gradient(phase[k], phase[k + 1]) : 0.0f;
-    grady[k] = (y + 1 < ysize) ? device_gradient(phase[k], phase[k + xsize]) : 0.0f;
-}
-
 __global__ void k_tile_local_fourdir_floodfill(const float *phase,
                                                unsigned char *bitflags,
                                                float *soln,
@@ -870,170 +863,6 @@ __device__ __forceinline__ bool first_valid_boundary_pair_down(const unsigned ch
     return false;
 }
 
-
-/* -----------------------------------------------------------------------
- * Robust GPU tile-height matching helpers.
- *
- * Instead of using the first valid boundary pixel pair, estimate the integer
- * 2*pi offset from all valid samples on the shared boundary.  This keeps the
- * original iterative GPU propagation structure, but makes each accepted tile
- * edge much less sensitive to cuts/noise/local islands.
- * ----------------------------------------------------------------------- */
-
-__device__ __forceinline__ bool tile_stitch_valid(const unsigned char *bitflags, int idx)
-{
-    return !(bitflags[idx] & kAvoid) && (bitflags[idx] & kUnwrapped);
-}
-
-__device__ __forceinline__ void majority_vote_add(int k, int &candidate, int &balance)
-{
-    if (balance == 0) {
-        candidate = k;
-        balance = 1;
-    } else if (k == candidate) {
-        ++balance;
-    } else {
-        --balance;
-    }
-}
-
-__device__ __forceinline__ bool robust_boundary_right_offset(
-    const unsigned char *bitflags,
-    const float *soln,
-    const float *gradx,
-    int xsize,
-    int ysize,
-    int tx,
-    int ty,
-    bool known_is_left,
-    float known_off,
-    float *neighbor_off_out)
-{
-    const int ax = min((tx + 1) * STAGE3_TILE_W, xsize) - 1;
-    const int bx = ax + 1;
-    if (ax < 0 || bx >= xsize) return false;
-
-    const int y0 = ty * STAGE3_TILE_H;
-    const int y1 = min(y0 + STAGE3_TILE_H, ysize);
-    const float inv_twopi = 1.0f / (float)TWOPI;
-
-    int candidate = 0;
-    int balance = 0;
-    int total = 0;
-
-    /* First pass: Boyer-Moore majority candidate over integer 2*pi offsets. */
-    for (int y = y0; y < y1; ++y) {
-        const int a = y * xsize + ax;  /* left tile boundary pixel */
-        const int b = y * xsize + bx;  /* right tile boundary pixel */
-        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
-
-        float raw;
-        if (known_is_left) {
-            /* offset[right] = soln[left] + off[left] - gradx[left] - soln[right] */
-            raw = (soln[a] + known_off - gradx[a]) - soln[b];
-        } else {
-            /* offset[left] = soln[right] + off[right] + gradx[left] - soln[left] */
-            raw = (soln[b] + known_off + gradx[a]) - soln[a];
-        }
-        const int k = __float2int_rn(raw * inv_twopi);
-        majority_vote_add(k, candidate, balance);
-        ++total;
-    }
-
-    if (total <= 0) return false;
-
-    int support = 0;
-    for (int y = y0; y < y1; ++y) {
-        const int a = y * xsize + ax;
-        const int b = y * xsize + bx;
-        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
-
-        float raw;
-        if (known_is_left)
-            raw = (soln[a] + known_off - gradx[a]) - soln[b];
-        else
-            raw = (soln[b] + known_off + gradx[a]) - soln[a];
-        const int k = __float2int_rn(raw * inv_twopi);
-        if (k == candidate) ++support;
-    }
-
-    if (support < STAGE3_STITCH_MIN_SUPPORT) return false;
-#if STAGE3_STITCH_REQUIRE_MAJORITY
-    if (support * 2 < total) return false;
-#endif
-
-    *neighbor_off_out = (float)candidate * (float)TWOPI;
-    return true;
-}
-
-__device__ __forceinline__ bool robust_boundary_down_offset(
-    const unsigned char *bitflags,
-    const float *soln,
-    const float *grady,
-    int xsize,
-    int ysize,
-    int tx,
-    int ty,
-    bool known_is_top,
-    float known_off,
-    float *neighbor_off_out)
-{
-    const int ay = min((ty + 1) * STAGE3_TILE_H, ysize) - 1;
-    const int by = ay + 1;
-    if (ay < 0 || by >= ysize) return false;
-
-    const int x0 = tx * STAGE3_TILE_W;
-    const int x1 = min(x0 + STAGE3_TILE_W, xsize);
-    const float inv_twopi = 1.0f / (float)TWOPI;
-
-    int candidate = 0;
-    int balance = 0;
-    int total = 0;
-
-    for (int x = x0; x < x1; ++x) {
-        const int a = ay * xsize + x;  /* top tile boundary pixel */
-        const int b = by * xsize + x;  /* bottom tile boundary pixel */
-        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
-
-        float raw;
-        if (known_is_top) {
-            /* offset[bottom] = soln[top] + off[top] - grady[top] - soln[bottom] */
-            raw = (soln[a] + known_off - grady[a]) - soln[b];
-        } else {
-            /* offset[top] = soln[bottom] + off[bottom] + grady[top] - soln[top] */
-            raw = (soln[b] + known_off + grady[a]) - soln[a];
-        }
-        const int k = __float2int_rn(raw * inv_twopi);
-        majority_vote_add(k, candidate, balance);
-        ++total;
-    }
-
-    if (total <= 0) return false;
-
-    int support = 0;
-    for (int x = x0; x < x1; ++x) {
-        const int a = ay * xsize + x;
-        const int b = by * xsize + x;
-        if (!tile_stitch_valid(bitflags, a) || !tile_stitch_valid(bitflags, b)) continue;
-
-        float raw;
-        if (known_is_top)
-            raw = (soln[a] + known_off - grady[a]) - soln[b];
-        else
-            raw = (soln[b] + known_off + grady[a]) - soln[a];
-        const int k = __float2int_rn(raw * inv_twopi);
-        if (k == candidate) ++support;
-    }
-
-    if (support < STAGE3_STITCH_MIN_SUPPORT) return false;
-#if STAGE3_STITCH_REQUIRE_MAJORITY
-    if (support * 2 < total) return false;
-#endif
-
-    *neighbor_off_out = (float)candidate * (float)TWOPI;
-    return true;
-}
-
 __global__ void k_init_tile_offsets(const unsigned char *bitflags,
                                     int *tile_known,
                                     float *tile_offsets,
@@ -1091,46 +920,36 @@ __global__ void k_tile_offset_relax(const unsigned char *bitflags,
     const int ty = tid / tiles_x;
     const float off = tile_offsets[tid];
 
-    float noff;
-
-    /* Propagate to right neighbor. Shared boundary belongs to tile (tx, ty). */
-    if (tx + 1 < tiles_x &&
-        robust_boundary_right_offset(bitflags, soln, gradx, xsize, ysize,
-                                     tx, ty, true, off, &noff)) {
+    int a, b;
+    if (tx + 1 < tiles_x && first_valid_boundary_pair_right(bitflags, xsize, ysize, tx, ty, &a, &b)) {
         const int nt = tid + 1;
+        const float noff = (soln[a] + off - gradx[a]) - soln[b];
         if (atomicCAS(&tile_known[nt], 0, 1) == 0) {
             tile_offsets[nt] = noff;
             atomicExch(changed, 1);
         }
     }
-
-    /* Propagate to left neighbor. Shared boundary belongs to tile (tx - 1, ty). */
-    if (tx > 0 &&
-        robust_boundary_right_offset(bitflags, soln, gradx, xsize, ysize,
-                                     tx - 1, ty, false, off, &noff)) {
+    if (tx > 0 && first_valid_boundary_pair_right(bitflags, xsize, ysize, tx - 1, ty, &a, &b)) {
         const int nt = tid - 1;
+        /* Here b is current-tile left boundary, a is neighbor right boundary. */
+        const float noff = (soln[b] + off + gradx[a]) - soln[a];
         if (atomicCAS(&tile_known[nt], 0, 1) == 0) {
             tile_offsets[nt] = noff;
             atomicExch(changed, 1);
         }
     }
-
-    /* Propagate to bottom neighbor. Shared boundary belongs to tile (tx, ty). */
-    if (ty + 1 < tiles_y &&
-        robust_boundary_down_offset(bitflags, soln, grady, xsize, ysize,
-                                    tx, ty, true, off, &noff)) {
+    if (ty + 1 < tiles_y && first_valid_boundary_pair_down(bitflags, xsize, ysize, tx, ty, &a, &b)) {
         const int nt = tid + tiles_x;
+        const float noff = (soln[a] + off - grady[a]) - soln[b];
         if (atomicCAS(&tile_known[nt], 0, 1) == 0) {
             tile_offsets[nt] = noff;
             atomicExch(changed, 1);
         }
     }
-
-    /* Propagate to top neighbor. Shared boundary belongs to tile (tx, ty - 1). */
-    if (ty > 0 &&
-        robust_boundary_down_offset(bitflags, soln, grady, xsize, ysize,
-                                    tx, ty - 1, false, off, &noff)) {
+    if (ty > 0 && first_valid_boundary_pair_down(bitflags, xsize, ysize, tx, ty - 1, &a, &b)) {
         const int nt = tid - tiles_x;
+        /* Here b is current-tile top boundary, a is neighbor bottom boundary. */
+        const float noff = (soln[b] + off + grady[a]) - soln[a];
         if (atomicCAS(&tile_known[nt], 0, 1) == 0) {
             tile_offsets[nt] = noff;
             atomicExch(changed, 1);
@@ -1157,9 +976,72 @@ __global__ void k_apply_tile_offsets(float *soln,
     if (tile_known[tid]) soln[k] += tile_offsets[tid];
 }
 
+
+__global__ void k_bfs_expand(const float        *phase,
+                              unsigned char      *bitflags,
+                              float              *soln,
+                              const float        *gradx,
+                              const float        *grady,
+                              const int          *d_in,
+                              int                 n_in,
+                              int                *d_out,
+                              int                *n_out,
+                              int                 xsize,
+                              int                 ysize)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_in) return;
+
+    const int kk  = d_in[t];
+    const int x   = kk % xsize;
+    const int y   = kk / xsize;
+    const float val = soln[kk];
+
+    /* left */
+    if (x - 1 >= 0) {
+        const int nb = kk - 1;
+        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+            if (claim_pixel(bitflags, nb)) {
+                soln[nb] = val + gradx[nb];
+                d_out[atomicAdd(n_out, 1)] = nb;
+            }
+        }
+    }
+    /* right */
+    if (x + 1 < xsize) {
+        const int nb = kk + 1;
+        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+            if (claim_pixel(bitflags, nb)) {
+                soln[nb] = val - gradx[kk];
+                d_out[atomicAdd(n_out, 1)] = nb;
+            }
+        }
+    }
+    /* up */
+    if (y - 1 >= 0) {
+        const int nb = kk - xsize;
+        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+            if (claim_pixel(bitflags, nb)) {
+                soln[nb] = val + grady[nb];
+                d_out[atomicAdd(n_out, 1)] = nb;
+            }
+        }
+    }
+    /* down */
+    if (y + 1 < ysize) {
+        const int nb = kk + xsize;
+        if (!(bitflags[nb] & (kAvoid | kUnwrapped))) {
+            if (claim_pixel(bitflags, nb)) {
+                soln[nb] = val - grady[kk];
+                d_out[atomicAdd(n_out, 1)] = nb;
+            }
+        }
+    }
+}
+
 /* -----------------------------------------------------------------------
  * Stage 3 kernel 3: AVOID-band fill (branch cuts + border pixels)
- * Same logic as the CPU serial AVOID pass — run once after tile stitching.
+ * Same logic as the CPU serial AVOID pass — run once after BFS converges.
  * One thread per pixel; only acts on pixels with kAvoid set.
  * ----------------------------------------------------------------------- */
 __global__ void k_avoid_fill(const float   *phase,
@@ -1252,6 +1134,17 @@ extern "C" int unwrap_cuda_device_bufs_alloc(int length, UnwrapCudaDeviceBufs *o
     e = cudaMalloc((void **)&out->d_grady, (size_t)length * sizeof(float));
     if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
+    e = cudaMalloc((void **)&out->d_frontier_a, (size_t)length * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+
+    e = cudaMalloc((void **)&out->d_frontier_b, (size_t)length * sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+
+    e = cudaMalloc((void **)&out->d_frontier_count_a, sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
+
+    e = cudaMalloc((void **)&out->d_frontier_count_b, sizeof(int));
+    if (e != cudaSuccess) { unwrap_cuda_device_bufs_free(out); return (int)e; }
 
     return 0;
 }
@@ -1269,6 +1162,10 @@ extern "C" void unwrap_cuda_device_bufs_free(UnwrapCudaDeviceBufs *buf)
     cudaFree(buf->d_pairs);
     cudaFree(buf->d_gradx);
     cudaFree(buf->d_grady);
+    cudaFree(buf->d_frontier_a);
+    cudaFree(buf->d_frontier_b);
+    cudaFree(buf->d_frontier_count_a);
+    cudaFree(buf->d_frontier_count_b);
     memset(buf, 0, sizeof(*buf));
 }
 
@@ -1607,7 +1504,6 @@ extern "C" void unwrap_cuda_launch_residue_matching(unsigned char *h_bitflags,
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
     print_cuda_interval("Stage2 D2H bitflags", t0, t1);
-    fflush(stdout);
     if (e != cudaSuccess)
         cuda_fail(e, "D2H bitflags");
 
@@ -1625,10 +1521,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int ysize,
     int length)
 {
-    (void)h_gradx;
-    (void)h_grady;
-
-    if (!h_phase || !h_bitflags || !h_soln
+    if (!h_phase || !h_bitflags || !h_soln || !h_gradx || !h_grady
         || !dev || !dev->d_phase || !dev->d_bitflags || !dev->d_soln
         || !dev->d_gradx || !dev->d_grady || xsize <= 0 || ysize <= 0
         || length != xsize * ysize) {
@@ -1636,11 +1529,15 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         return;
     }
 
-    printf("  [GPU][Stage3 timing] begin (tile-independent four-direction unwrap, robust GPU vote stitch)\n");
-    fflush(stdout);
+    printf("  [GPU][Stage3 timing] begin (tile four-direction floodfill)\n");
 
-    cudaError_t e = cudaSuccess;
-    cudaEvent_t t0 = nullptr, t1 = nullptr, total0 = nullptr, total1 = nullptr;
+    cudaError_t e;
+    cudaEvent_t t0, t1, total0, total1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    cudaEventCreate(&total0);
+    cudaEventCreate(&total1);
+    cudaEventRecord(total0, 0);
 
     const int tiles_x = div_up_int(xsize, STAGE3_TILE_W);
     const int tiles_y = div_up_int(ysize, STAGE3_TILE_H);
@@ -1654,17 +1551,6 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     int *d_tile_known = nullptr;
     int *d_changed = nullptr;
     float *d_tile_offsets = nullptr;
-
-    e = cudaEventCreate(&t0);
-    if (cuda_fail(e, "Stage3 create event t0")) goto cleanup;
-    e = cudaEventCreate(&t1);
-    if (cuda_fail(e, "Stage3 create event t1")) goto cleanup;
-    e = cudaEventCreate(&total0);
-    if (cuda_fail(e, "Stage3 create event total0")) goto cleanup;
-    e = cudaEventCreate(&total1);
-    if (cuda_fail(e, "Stage3 create event total1")) goto cleanup;
-    e = cudaEventRecord(total0, 0);
-    if (cuda_fail(e, "Stage3 record total0")) goto cleanup;
 
     e = cudaMalloc((void **)&d_tile_known, (size_t)ntiles * sizeof(int));
     if (cuda_fail(e, "Stage3 malloc tile_known")) goto cleanup;
@@ -1680,19 +1566,13 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     if (cuda_fail(e, "Stage3 H2D bitflags")) goto cleanup;
     e = cudaMemset(dev->d_soln, 0, (size_t)length * sizeof(float));
     if (cuda_fail(e, "Stage3 memset soln")) goto cleanup;
-    {
-        dim3 block(16, 16);
-        dim3 grid(div_up_int(xsize, block.x), div_up_int(ysize, block.y));
-        k_compute_unwrap_gradients<<<grid, block>>>(dev->d_phase, dev->d_gradx, dev->d_grady,
-                                                    xsize, ysize);
-        e = cudaGetLastError();
-        if (cuda_fail(e, "k_compute_unwrap_gradients")) goto cleanup;
-        e = cudaDeviceSynchronize();
-        if (cuda_fail(e, "sync k_compute_unwrap_gradients")) goto cleanup;
-    }
+    e = cudaMemcpy(dev->d_gradx, h_gradx, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D gradx")) goto cleanup;
+    e = cudaMemcpy(dev->d_grady, h_grady, (size_t)length * sizeof(float), cudaMemcpyHostToDevice);
+    if (cuda_fail(e, "Stage3 H2D grady")) goto cleanup;
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 H2D + GPU gradients", t0, t1);
+    print_cuda_interval("Stage3 H2D inputs", t0, t1);
 
     cudaEventRecord(t0, 0);
     {
@@ -1733,8 +1613,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         if (cuda_fail(e, "k_tile_offset_relax")) goto cleanup;
         e = cudaDeviceSynchronize();
         if (cuda_fail(e, "sync k_tile_offset_relax")) goto cleanup;
-        e = cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
-        if (cuda_fail(e, "Stage3 D2H changed")) goto cleanup;
+        cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
         ++relax_iter;
     }
     cudaEventRecord(t1, 0);
@@ -1771,16 +1650,15 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     cudaEventRecord(total1, 0);
     cudaEventSynchronize(total1);
     print_cuda_interval("Stage3 tile total", total0, total1);
-    printf("  [GPU] Stage3 tile-independent fourdir+GPU-vote-stitch: tile=%dx%d tiles=%dx%d relax_iters=%d/%d min_support=%d majority=%d\n",
-           STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y, relax_iter, max_relax,
-           STAGE3_STITCH_MIN_SUPPORT, STAGE3_STITCH_REQUIRE_MAJORITY);
+    printf("  [GPU] Stage3 tile fourdir: tile=%dx%d tiles=%dx%d relax_iters=%d/%d\n",
+           STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y, relax_iter, max_relax);
 
 cleanup:
     cudaFree(d_tile_known);
     cudaFree(d_tile_offsets);
     cudaFree(d_changed);
-    if (t0) cudaEventDestroy(t0);
-    if (t1) cudaEventDestroy(t1);
-    if (total0) cudaEventDestroy(total0);
-    if (total1) cudaEventDestroy(total1);
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    cudaEventDestroy(total0);
+    cudaEventDestroy(total1);
 }
