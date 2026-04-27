@@ -164,6 +164,18 @@ constexpr int POS_CHUNK = STAGE2_POS_CHUNK;
 #define STAGE3_TILE_RELAX_MAX_ITERS 4096
 #endif
 
+#ifndef STAGE3_TILE_WAVEFRONT_THREADS
+/* Threads per tile CTA for the SIMD/SIMT local wavefront unwrap.
+   256 works well for 32x32 tiles: each thread owns about 4 pixels. */
+#define STAGE3_TILE_WAVEFRONT_THREADS 256
+#endif
+#ifndef STAGE3_TILE_WAVEFRONT_MAX_ROUNDS
+/* Upper bound for one connected-component wave expansion inside a tile.
+   Using 4x tile diameter keeps the wavefront robust around local branch-cut
+   obstacles while still bounding per-tile work. */
+#define STAGE3_TILE_WAVEFRONT_MAX_ROUNDS ((STAGE3_TILE_W + STAGE3_TILE_H) * 4)
+#endif
+
 #ifndef STAGE3_STITCH_MIN_SUPPORT
 /* Minimum same-k boundary votes required before accepting a tile-to-tile height edge. */
 #define STAGE3_STITCH_MIN_SUPPORT 4
@@ -715,106 +727,153 @@ __global__ void k_compute_unwrap_gradients(const float *phase,
     grady[k] = (y + 1 < ysize) ? device_gradient(phase[k], phase[k + xsize]) : 0.0f;
 }
 
-__global__ void k_tile_local_fourdir_floodfill(const float *phase,
-                                               unsigned char *bitflags,
-                                               float *soln,
-                                               const float *gradx,
-                                               const float *grady,
-                                               int xsize,
-                                               int ysize)
+__global__ void k_tile_local_fourdir_wavefront(const float *phase,
+                                                unsigned char *bitflags,
+                                                float *soln,
+                                                const float *gradx,
+                                                const float *grady,
+                                                int xsize,
+                                                int ysize)
 {
+    constexpr int TILE_PIXELS = STAGE3_TILE_W * STAGE3_TILE_H;
+    enum : unsigned char {
+        TILE_UNKNOWN = 0,
+        TILE_DONE    = 1,
+        TILE_CUT     = 2
+    };
+
+    __shared__ float s_sol[TILE_PIXELS];
+    __shared__ unsigned char s_state[TILE_PIXELS];
+    __shared__ int s_seed_pack;
+    __shared__ int s_changed;
+
     const int tile_x = blockIdx.x;
     const int tile_y = blockIdx.y;
     const int x0 = tile_x * STAGE3_TILE_W;
     const int y0 = tile_y * STAGE3_TILE_H;
     const int x1 = min(x0 + STAGE3_TILE_W, xsize);
     const int y1 = min(y0 + STAGE3_TILE_H, ysize);
+    const int local_w = x1 - x0;
+    const int local_h = y1 - y0;
+    const int local_count = local_w * local_h;
+    const int tid = threadIdx.x;
 
-    /* One lane per tile. This is deliberately simple/correctness-oriented;
-       parallelism comes from running many tiles concurrently. */
-    if (threadIdx.x != 0) return;
+    if (local_count <= 0) return;
+
+    /* Load tile-valid state into shared memory.  We do not need shared phase:
+       all propagation uses precomputed wrapped gradients plus shared local soln. */
+    for (int li = tid; li < local_count; li += blockDim.x) {
+        const int lx = li % local_w;
+        const int ly = li / local_w;
+        const int g = (y0 + ly) * xsize + (x0 + lx);
+
+        s_sol[li] = phase[g];
+        s_state[li] = (bitflags[g] & kAvoid) ? TILE_CUT : TILE_UNKNOWN;
+    }
+    __syncthreads();
 
     int restarts = 0;
     while (restarts < STAGE3_TILE_LOCAL_MAX_RESTARTS) {
-        int seed = -1;
-        for (int y = y0; y < y1 && seed < 0; ++y) {
-            for (int x = x0; x < x1; ++x) {
-                const int k = y * xsize + x;
-                if (!(bitflags[k] & (kAvoid | kUnwrapped))) {
-                    seed = k;
-                    break;
-                }
-            }
+        if (tid == 0) s_seed_pack = INT_MAX;
+        __syncthreads();
+
+        /* Pick a deterministic seed for the next connected component:
+           the unvisited valid pixel closest to the tile center.  Each tile still
+           has an arbitrary local 2*pi height; the later tile graph fixes that. */
+        const int cx = local_w / 2;
+        const int cy = local_h / 2;
+        for (int li = tid; li < local_count; li += blockDim.x) {
+            if (s_state[li] != TILE_UNKNOWN) continue;
+            const int lx = li % local_w;
+            const int ly = li / local_w;
+            const int dx = lx - cx;
+            const int dy = ly - cy;
+            const int score = dx * dx + dy * dy;
+            const int pack = score * TILE_PIXELS + li;
+            atomicMin(&s_seed_pack, pack);
         }
-        if (seed < 0) break;
+        __syncthreads();
 
-        bitflags[seed] |= kUnwrapped;
-        soln[seed] = phase[seed];
+        if (s_seed_pack == INT_MAX) break;
 
-        bool changed = true;
-        int iter = 0;
-        const int max_iter = (STAGE3_TILE_W + STAGE3_TILE_H) * 4;
-        while (changed && iter < max_iter) {
-            changed = false;
-
-            /* left -> right */
-            for (int y = y0; y < y1; ++y) {
-                for (int x = x0 + 1; x < x1; ++x) {
-                    const int k = y * xsize + x;
-                    const int l = k - 1;
-                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[l] & kUnwrapped)
-                        && !(bitflags[l] & kAvoid)) {
-                        soln[k] = soln[l] - gradx[l];
-                        bitflags[k] |= kUnwrapped;
-                        changed = true;
-                    }
-                }
-            }
-
-            /* right -> left */
-            for (int y = y0; y < y1; ++y) {
-                for (int x = x1 - 2; x >= x0; --x) {
-                    const int k = y * xsize + x;
-                    const int r = k + 1;
-                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[r] & kUnwrapped)
-                        && !(bitflags[r] & kAvoid)) {
-                        soln[k] = soln[r] + gradx[k];
-                        bitflags[k] |= kUnwrapped;
-                        changed = true;
-                    }
-                }
-            }
-
-            /* top -> bottom */
-            for (int y = y0 + 1; y < y1; ++y) {
-                for (int x = x0; x < x1; ++x) {
-                    const int k = y * xsize + x;
-                    const int u = k - xsize;
-                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[u] & kUnwrapped)
-                        && !(bitflags[u] & kAvoid)) {
-                        soln[k] = soln[u] - grady[u];
-                        bitflags[k] |= kUnwrapped;
-                        changed = true;
-                    }
-                }
-            }
-
-            /* bottom -> top */
-            for (int y = y1 - 2; y >= y0; --y) {
-                for (int x = x0; x < x1; ++x) {
-                    const int k = y * xsize + x;
-                    const int d = k + xsize;
-                    if (!(bitflags[k] & (kAvoid | kUnwrapped)) && (bitflags[d] & kUnwrapped)
-                        && !(bitflags[d] & kAvoid)) {
-                        soln[k] = soln[d] + grady[k];
-                        bitflags[k] |= kUnwrapped;
-                        changed = true;
-                    }
-                }
-            }
-            ++iter;
+        const int seed = s_seed_pack % TILE_PIXELS;
+        if (tid == 0) {
+            const int sx = seed % local_w;
+            const int sy = seed / local_w;
+            const int sg = (y0 + sy) * xsize + (x0 + sx);
+            s_sol[seed] = phase[sg];
+            s_state[seed] = TILE_DONE;
         }
+        __syncthreads();
+
+        /* SIMT wavefront floodfill.  Each round all unknown pixels try to attach
+           to an already-unwrapped 4-neighbor.  This replaces the old one-thread
+           CPU-style tile sweep while preserving local four-direction semantics.
+
+           Sign convention follows k_compute_unwrap_gradients():
+             gradx[p] = wrap(phase[p] - phase[p+1])
+             grady[p] = wrap(phase[p] - phase[p+xsize])
+           Therefore:
+             from left  L -> P: sol[P] = sol[L] - gradx[L]
+             from right R -> P: sol[P] = sol[R] + gradx[P]
+             from up    U -> P: sol[P] = sol[U] - grady[U]
+             from down  D -> P: sol[P] = sol[D] + grady[P]
+        */
+        for (int round = 0; round < STAGE3_TILE_WAVEFRONT_MAX_ROUNDS; ++round) {
+            if (tid == 0) s_changed = 0;
+            __syncthreads();
+
+            for (int li = tid; li < local_count; li += blockDim.x) {
+                if (s_state[li] != TILE_UNKNOWN) continue;
+
+                const int lx = li % local_w;
+                const int ly = li / local_w;
+                const int g = (y0 + ly) * xsize + (x0 + lx);
+
+                float v = 0.0f;
+                bool can_unwrap = false;
+
+                /* Fixed priority makes the result deterministic enough for
+                   debugging.  Other priorities are possible. */
+                if (lx > 0 && s_state[li - 1] == TILE_DONE) {
+                    v = s_sol[li - 1] - gradx[g - 1];
+                    can_unwrap = true;
+                } else if (lx + 1 < local_w && s_state[li + 1] == TILE_DONE) {
+                    v = s_sol[li + 1] + gradx[g];
+                    can_unwrap = true;
+                } else if (ly > 0 && s_state[li - local_w] == TILE_DONE) {
+                    v = s_sol[li - local_w] - grady[g - xsize];
+                    can_unwrap = true;
+                } else if (ly + 1 < local_h && s_state[li + local_w] == TILE_DONE) {
+                    v = s_sol[li + local_w] + grady[g];
+                    can_unwrap = true;
+                }
+
+                if (can_unwrap) {
+                    s_sol[li] = v;
+                    __threadfence_block();
+                    s_state[li] = TILE_DONE;
+                    atomicExch(&s_changed, 1);
+                }
+            }
+            __syncthreads();
+            if (!s_changed) break;
+        }
+
         ++restarts;
+        __syncthreads();
+    }
+
+    /* Commit local tile result.  Only pixels reached by the wavefront become
+       kUnwrapped and participate in tile-boundary height voting. */
+    for (int li = tid; li < local_count; li += blockDim.x) {
+        const int lx = li % local_w;
+        const int ly = li / local_w;
+        const int g = (y0 + ly) * xsize + (x0 + lx);
+        if (s_state[li] == TILE_DONE) {
+            soln[g] = s_sol[li];
+            bitflags[g] |= kUnwrapped;
+        }
     }
 }
 
@@ -1528,7 +1587,7 @@ extern "C" void unwrap_cuda_launch_unwrapping(
         return;
     }
 
-    printf("  [GPU][Stage3 timing] begin (tile-independent unwrap + tile-graph height stitching)\n");
+    printf("  [GPU][Stage3 timing] begin (tile-independent wavefront unwrap + tile-graph height stitching)\n");
     fflush(stdout);
 
     cudaError_t e = cudaSuccess;
@@ -1625,16 +1684,17 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     cudaEventRecord(t0, 0);
     {
         dim3 grid(tiles_x, tiles_y);
-        k_tile_local_fourdir_floodfill<<<grid, 1>>>(dev->d_phase, dev->d_bitflags, dev->d_soln,
-                                                    dev->d_gradx, dev->d_grady, xsize, ysize);
+        k_tile_local_fourdir_wavefront<<<grid, STAGE3_TILE_WAVEFRONT_THREADS>>>(
+            dev->d_phase, dev->d_bitflags, dev->d_soln,
+            dev->d_gradx, dev->d_grady, xsize, ysize);
         e = cudaGetLastError();
-        if (cuda_fail(e, "k_tile_local_fourdir_floodfill")) goto cleanup;
+        if (cuda_fail(e, "k_tile_local_fourdir_wavefront")) goto cleanup;
         e = cudaDeviceSynchronize();
-        if (cuda_fail(e, "sync k_tile_local_fourdir_floodfill")) goto cleanup;
+        if (cuda_fail(e, "sync k_tile_local_fourdir_wavefront")) goto cleanup;
     }
     cudaEventRecord(t1, 0);
     cudaEventSynchronize(t1);
-    print_cuda_interval("Stage3 tile-local fourdir", t0, t1);
+    print_cuda_interval("Stage3 tile-local wavefront", t0, t1);
 
     cudaEventRecord(t0, 0);
     k_build_tile_edge_constraints<<<tile_blocks, tile_threads>>>(
@@ -1803,8 +1863,8 @@ extern "C" void unwrap_cuda_launch_unwrapping(
     cudaEventRecord(total1, 0);
     cudaEventSynchronize(total1);
     print_cuda_interval("Stage3 tile total", total0, total1);
-    printf("  [GPU] Stage3 tile-independent+tilegraph-stitch: tile=%dx%d tiles=%dx%d valid_edges=%d visited_tiles=%d/%d components=%d conflicts=%d max_abs_offset_k=%d min_support=%d majority=%d\n",
-           STAGE3_TILE_W, STAGE3_TILE_H, tiles_x, tiles_y,
+    printf("  [GPU] Stage3 wavefront+tilegraph-stitch: tile=%dx%d threads=%d tiles=%dx%d valid_edges=%d visited_tiles=%d/%d components=%d conflicts=%d max_abs_offset_k=%d min_support=%d majority=%d\n",
+           STAGE3_TILE_W, STAGE3_TILE_H, STAGE3_TILE_WAVEFRONT_THREADS, tiles_x, tiles_y,
            valid_edges, visited_tiles, ntiles, components, conflicts, max_abs_offset_k,
            STAGE3_STITCH_MIN_SUPPORT, STAGE3_STITCH_REQUIRE_MAJORITY);
 
