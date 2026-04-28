@@ -1303,7 +1303,6 @@ static void soln_diff_stats(const float *a, const float *b, int n,
 
 
 /* -----------------------------------------------------------------------
-<<<<<<< HEAD
  *  Pluggable unwrap kernels (timed as one unit inside goldstein_phase_unwrapping)
  *
  *  UNWRAP_BACKEND_PARALLEL_CPU — OpenMP residues + parallel branch cuts +
@@ -1537,8 +1536,6 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
 };
 
 /* -----------------------------------------------------------------------
-=======
->>>>>>> parent of 24745ee (	modified:   src/main.c)
  *  Core phase-unwrapping pipeline
  *
  *  input_path    – full path to the input file.
@@ -1549,11 +1546,7 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
  *
  *  output_prefix – path prefix used for output files (no extension).
  *                  Always writes *_unwrapped.tif (float32 radians).
-<<<<<<< HEAD
  *                  With verify_serial: *_residues.tif and *_branchcuts.tif (debug).
-=======
- *                  With verify_serial: also *_residues.tif and *_branchcuts.tif.
->>>>>>> parent of 24745ee (	modified:   src/main.c)
  *
  *  type          – binary-format selector passed to GetPhase (ignored for
  *                  image inputs):
@@ -1569,7 +1562,6 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
  *  gt_lo, gt_hi  – optional metadata from JSON (for logging only; RMS uses
  *                  samples read directly from the TIFF).
  *  gt_json_valid – 1 if true_lo/true_hi were read from JSON successfully.
-<<<<<<< HEAD
  *  verify_serial  – if non-zero, run serial-reference checks for the selected
  *                   backend: residue flags vs Residues_serial; branch layout
  *                   vs GoldsteinBranchCuts_serial and vs parallel@1 thread from
@@ -1584,15 +1576,6 @@ static const char *g_unwrap_backend_names[UNWRAP_BACKEND_COUNT] = {
  *  Return value  – elapsed ms for the selected unwrap kernel (sum of residue,
  *                  optional CUDA match, branch cuts, and frontier unwrap).
  *                  A timing report also prints host I/O, prep, verify, and output.
-=======
- *  verify_serial  – if non-zero, compare parallel pipeline vs serial references
- *                   at residues, branch cuts (serial vs 1-thread parallel),
- *                   and unwrap (OMP vs serial AVOID-band pass).
- *
- *  Return value  – elapsed ms for the parallel kernel only (residue detect +
- *                  Goldstein branch cuts + frontier unwrap).  Disk I/O, RMS,
- *                  and verify_serial work are timed separately (outside).
->>>>>>> parent of 24745ee (	modified:   src/main.c)
  * -------------------------------------------------------------------- */
 double goldstein_phase_unwrapping(const char *input_path,
                                    const char *output_prefix,
@@ -1604,7 +1587,8 @@ double goldstein_phase_unwrapping(const char *input_path,
                                    double gt_lo,
                                    double gt_hi,
                                    int gt_json_valid,
-                                   int verify_serial)
+                                   int verify_serial,
+                                   int unwrap_backend)
 {
     int           *path_order;
     float         *phase;
@@ -1612,7 +1596,6 @@ double goldstein_phase_unwrapping(const char *input_path,
     float         *grady, *gradx;
     float         *mask;
     unsigned char *unwrap, *bitflags;
-    clock_t        t1, t2;
     double         elapsed_time;
     double         ms_load_phase = 0.0, ms_load_mask = 0.0, ms_bitflags_init = 0.0;
     double         ms_gradxy = 0.0, ms_cuda_setup = 0.0, ms_verify = 0.0;
@@ -1639,7 +1622,6 @@ double goldstein_phase_unwrapping(const char *input_path,
     int            *path_order_ser = NULL, *path_order_gold = NULL;
 
     int is_tiff = is_tiff_path(input_path);
-<<<<<<< HEAD
     int verify_effective;
 
     if (unwrap_backend < 0 || unwrap_backend >= UNWRAP_BACKEND_COUNT) {
@@ -1652,8 +1634,6 @@ double goldstein_phase_unwrapping(const char *input_path,
     verify_effective = verify_serial;
     if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
         verify_effective = 0;  /* max-perf CUDA path keeps intermediate data on device */
-=======
->>>>>>> parent of 24745ee (	modified:   src/main.c)
 
     /* ---- For TIFF inputs load now to discover dimensions ---- */
     float *img_phase = NULL;
@@ -1732,7 +1712,7 @@ double goldstein_phase_unwrapping(const char *input_path,
 
     MaxCutLen = (xsize + ysize) / 2;
 
-    if (verify_serial) {
+    if (verify_effective) {
         snap_after_res = (unsigned char *)malloc((size_t)length);
         if (!snap_after_res)
             fprintf(stderr,
@@ -1754,7 +1734,6 @@ double goldstein_phase_unwrapping(const char *input_path,
         }
     }
 
-<<<<<<< HEAD
     /* ---- Pluggable unwrap kernel (CUDA device malloc not timed below) ---- */
     {
         UnwrapKernelCtx     kctx;
@@ -1803,35 +1782,16 @@ double goldstein_phase_unwrapping(const char *input_path,
         if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
             unwrap_cuda_device_bufs_free(&kctx.cuda_dev);
     }
-=======
-    /* ---- Timed: OpenMP residues, branch cuts, frontier unwrap ---- */
-    t1 = clock();
-    NumRes = Residues_parallel(phase, bitflags, xsize, ysize);
-    if (verify_serial && snap_after_res)
-        memcpy(snap_after_res, bitflags, (size_t)length);
-    GoldsteinBranchCuts_parallel(bitflags, MaxCutLen, NumRes, xsize, ysize);
-    if (verify_serial && bf_preunwrap)
-        memcpy(bf_preunwrap, bitflags, (size_t)length);
-    num_pieces = UnwrapAroundCutsFrontier(phase, bitflags, soln,
-                                          xsize, ysize, path_order,
-                                          grady, gradx, list, length, 1);
-    t2 = clock();
-    elapsed_time = timediff(t1, t2);
->>>>>>> parent of 24745ee (	modified:   src/main.c)
 
     if (unwrap_backend == UNWRAP_BACKEND_CUDA_STUB)
         printf("Number of residues: device-resident (host count intentionally not copied)\n");
     else
         printf("Number of residues: %d\n", NumRes);
 
-<<<<<<< HEAD
     if (verify_effective) {
         _t0 = clock();
 
         /* 1) Verify Stage 1 residue flags against CPU serial residue pass. */
-=======
-    if (verify_serial) {
->>>>>>> parent of 24745ee (	modified:   src/main.c)
         bf_res_ser = (unsigned char *)malloc((size_t)length);
         if (bf_res_ser && snap_after_res) {
             for (k = 0; k < length; k++)
@@ -1960,18 +1920,14 @@ double goldstein_phase_unwrapping(const char *input_path,
         ms_verify = timediff(_t0, _t1);
     }
 
-<<<<<<< HEAD
     _t0 = clock();
     if (verify_effective && snap_after_res) {
-=======
-    if (verify_serial && snap_after_res) {
->>>>>>> parent of 24745ee (	modified:   src/main.c)
         snprintf(fname, sizeof(fname), "%s_residues.tif", output_prefix);
         save_byte_as_tiff(fname, snap_after_res, xsize, ysize, RESIDUE);
     }
     free(snap_after_res);
 
-    if (verify_serial) {
+    if (verify_effective) {
         snprintf(fname, sizeof(fname), "%s_branchcuts.tif", output_prefix);
         save_byte_as_tiff(fname, bitflags, xsize, ysize, BRANCH_CUT | BORDER);
     }
@@ -1982,10 +1938,6 @@ double goldstein_phase_unwrapping(const char *input_path,
     free(path_order_ser);
 
     printf("Number of pieces: %d\n", num_pieces);
-<<<<<<< HEAD
-=======
-    printf("Elapsed time (parallel kernel): %f ms\n", elapsed_time);
->>>>>>> parent of 24745ee (	modified:   src/main.c)
 
     /* ---- Save unwrapped phase (float32 radians) ---- */
     snprintf(fname, sizeof(fname), "%s_unwrapped.tif", output_prefix);
@@ -2056,11 +2008,26 @@ double goldstein_phase_unwrapping(const char *input_path,
 
 
 
+static int parse_unwrap_backend(const char *s)
+{
+    if (!s)
+        return -1;
+    if (!strcasecmp(s, "parallel") || !strcasecmp(s, "parallel_cpu"))
+        return UNWRAP_BACKEND_PARALLEL_CPU;
+    if (!strcasecmp(s, "serial") || !strcasecmp(s, "serial_cpu"))
+        return UNWRAP_BACKEND_SERIAL_CPU;
+    if (!strcasecmp(s, "cuda") || !strcasecmp(s, "cuda_stub"))
+        return UNWRAP_BACKEND_CUDA_STUB;
+    return -1;
+}
+
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s -i <input.tif> [-g <truth.tif> [-j <meta.json>]] [-m] [-t <threads>] [-v]\n"
+        "  %s -i <input.tif> [-g <truth.tif> [-j <meta.json>]] [-m] [-t <threads>] [-v] "
+        "[-B <backend>]\n"
         "  %s                 (default built-in binary test)\n"
         "\n"
         "Options:\n"
@@ -2072,15 +2039,10 @@ static void print_usage(const char *prog)
         "                         Default: input directory; stem from basename.\n"
         "  -m, --mask             Enable mask loading (<prefix>.mask)\n"
         "  -t, --threads <n>      Number of OpenMP threads\n"
-<<<<<<< HEAD
         "  -v, --verify-serial    Serial cross-checks for any -B backend;\n"
         "                         extra work/memory; debug residue/branch TIFFs\n"
         "  -B, --backend <name>   Unwrap kernel: parallel_cpu (default), serial_cpu,\n"
         "                         or cuda_stub (CPU pipeline + CUDA matching hook)\n"
-=======
-        "  -v, --verify-serial    Compare parallel vs serial; extra work/memory;\n"
-        "                         writes residues/branchcuts debug TIFFs\n"
->>>>>>> parent of 24745ee (	modified:   src/main.c)
         "  -h, --help             Show this help message\n"
         "\n"
         "Examples:\n"
@@ -2097,6 +2059,7 @@ int main(int argc, char *argv[])
     int    type      = 3;
     int    num_threads = 0;
     int    verify_serial = 0;
+    int    unwrap_backend = UNWRAP_BACKEND_PARALLEL_CPU;
     double elapsed_time = 0.0;
     int    i, opt;
 
@@ -2113,11 +2076,12 @@ int main(int argc, char *argv[])
         {"mask",    no_argument,       NULL, 'm'},
         {"threads", required_argument, NULL, 't'},
         {"verify-serial", no_argument, NULL, 'v'},
+        {"backend", required_argument, NULL, 'B'},
         {"help",    no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "i:g:j:o:mt:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:g:j:o:mt:vhB:", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'i': input_path  = optarg; break;
         case 'g': gt_path     = optarg; break;
@@ -2126,6 +2090,14 @@ int main(int argc, char *argv[])
         case 'm': mask_flag   = 1;      break;
         case 't': num_threads = atoi(optarg); break;
         case 'v': verify_serial = 1;  break;
+        case 'B':
+            unwrap_backend = parse_unwrap_backend(optarg);
+            if (unwrap_backend < 0) {
+                fprintf(stderr, "Error: unknown --backend '%s'\n", optarg);
+                print_usage(argv[0]);
+                return BAD_USAGE;
+            }
+            break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return BAD_USAGE;
         }
@@ -2144,6 +2116,7 @@ int main(int argc, char *argv[])
     }
     omp_set_num_threads(NUM_CORES);
     printf("Number of threads: %d\n", NUM_CORES);
+    printf("Unwrap backend: %s\n", g_unwrap_backend_names[unwrap_backend]);
 
     if (input_path) {
         /* ---- TIFF image mode ---- */
@@ -2224,7 +2197,8 @@ int main(int argc, char *argv[])
             type,
             0, 0,
             mask_flag,
-            gt_path, gt_lo, gt_hi, gt_json_valid, verify_serial);
+            gt_path, gt_lo, gt_hi, gt_json_valid, verify_serial,
+            unwrap_backend);
 
     } else {
         /* ---- Default: built-in binary test data ---- */
@@ -2245,7 +2219,8 @@ int main(int argc, char *argv[])
             elapsed_time += goldstein_phase_unwrapping(
                 bin_input, bin_prefix,
                 type, 1024, 1024, mask_flag,
-                NULL, 0.0, 0.0, 0, verify_serial);
+                NULL, 0.0, 0.0, 0, verify_serial,
+                unwrap_backend);
 
         elapsed_time /= (double)MAX_ITERATIONS;
         printf("\nAverage elapsed time: %f ms\n", elapsed_time);
